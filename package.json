@@ -1,0 +1,16 @@
+{
+  "name": "roblox-chat-server",
+  "version": "1.0.0",
+  "description": "Global Chat Server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^6.7.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
