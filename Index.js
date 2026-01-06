@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
-const ADMIN_PASSWORD = "123"; // ТВОЙ ПАРОЛЬ
+const ADMIN_PASSWORD = "hihpikpass"; // ТВОЙ ПАРОЛЬ
 let globalMessages = [];
 let mutedUsers = {};
 let bannedUsers = {};
