@@ -1,82 +1,94 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Разрешаем серверу понимать JSON, который присылает Roblox
 app.use(express.json());
 
-// --- НАСТРОЙКА 1: "Обрубаем" частые запросы (Защита от спама/DDoS) ---
-// Если один и тот же сервер Roblox шлет запросы слишком часто, мы его блокируем на время.
-const limiter = rateLimit({
-    windowMs: 1 * 60 * 1000, // 1 минута
-    max: 100, // Максимум 100 запросов с одного IP за 1 минуту
-    message: { error: "Слишком много запросов, подождите немного." }
-});
+// --- НАСТРОЙКИ ---
+const ADMIN_PASSWORD = "123"; // ПАРОЛЬ ОТ АДМИНКИ (ПОМЕНЯЙ ЕГО!)
+let globalMessages = [];
+let mutedUsers = {}; // Список мутов: { "Ник": timestamp_окончания }
 
-// Применяем ограничитель ко всем запросам
+const limiter = rateLimit({
+    windowMs: 1 * 60 * 1000,
+    max: 200, // Увеличили лимит для админки
+    message: { error: "Too many requests" }
+});
 app.use(limiter);
 
-
-// Хранилище сообщений (в памяти).
-// В реальном проекте лучше использовать Redis или Базу Данных.
-let globalMessages = []; 
-
-// --- НАСТРОЙКА 2: Функция очистки старых данных ---
-// Чтобы память сервера не переполнилась, удаляем старые сообщения
-const MAX_MESSAGES_HISTORY = 50; // Храним только последние 50 сообщений
-
-function cleanUpMessages() {
-    if (globalMessages.length > MAX_MESSAGES_HISTORY) {
-        // Отрезаем лишнее, оставляем только новые
-        globalMessages = globalMessages.slice(-MAX_MESSAGES_HISTORY);
-    }
-}
-
-
-// --- РОУТ: Получение сообщений (Get) ---
+// --- 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
 app.get('/chat', (req, res) => {
     res.json(globalMessages);
 });
 
-
-// --- РОУТ: Отправка сообщения (Post) ---
+// --- 2. ОТПРАВКА СООБЩЕНИЯ ---
 app.post('/chat', (req, res) => {
     const { player, message } = req.body;
+    if (!player || !message) return res.status(400).json({ error: "No data" });
 
-    // Простая валидация: данные должны существовать
-    if (!player || !message) {
-        return res.status(400).json({ error: "Неверные данные" });
+    // Проверка мута
+    if (mutedUsers[player]) {
+        if (Date.now() < mutedUsers[player]) {
+            const timeLeft = Math.ceil((mutedUsers[player] - Date.now()) / 1000);
+            return res.status(403).json({ error: "MUTED", timeLeft: timeLeft });
+        } else {
+            delete mutedUsers[player]; // Мут истек
+        }
     }
 
-    // --- НАСТРОЙКА 3: "Обрубаем" длинные сообщения ---
-    let finalMessage = message;
-    const MAX_LENGTH = 100; // Максимальная длина сообщения
-
-    if (finalMessage.length > MAX_LENGTH) {
-        // Обрезаем строку до 100 символов и добавляем "..."
-        finalMessage = finalMessage.substring(0, MAX_LENGTH) + "...";
-    }
-
-    // Создаем объект сообщения
-    const newMessage = {
+    let finalMessage = message.substring(0, 150); // Лимит 150 символов
+    
+    globalMessages.push({
         player: player,
         msg: finalMessage,
         timestamp: Date.now()
-    };
+    });
 
-    // Добавляем в массив
-    globalMessages.push(newMessage);
+    if (globalMessages.length > 50) globalMessages = globalMessages.slice(-50);
     
-    // Чистим историю, если накопилось много
-    cleanUpMessages();
-
-    console.log(`[CHAT] ${player}: ${finalMessage}`);
-    res.json({ status: "success", received: newMessage });
+    res.json({ status: "success" });
 });
 
-// Запуск сервера
-app.listen(PORT, () => {
-    console.log(`Сервер глобального чата запущен на порту ${PORT}`);
+// --- 3. КОМАНДЫ АДМИНА (МУТ / ОЧИСТКА) ---
+app.post('/admin', (req, res) => {
+    const { password, action, target, duration } = req.body;
+
+    if (password !== ADMIN_PASSWORD) {
+        return res.status(401).json({ error: "Wrong Password" });
+    }
+
+    if (action === "mute") {
+        // duration в секундах
+        const endTime = Date.now() + (duration * 1000);
+        mutedUsers[target] = endTime;
+        
+        // Добавляем системное сообщение
+        globalMessages.push({
+            player: "[SYSTEM]",
+            msg: `Игрок ${target} получил мут на ${duration} сек.`,
+            timestamp: Date.now()
+        });
+        
+        return res.json({ status: "Muted", target: target });
+    }
+
+    if (action === "clear") {
+        globalMessages = [];
+        globalMessages.push({
+            player: "[SYSTEM]",
+            msg: "Чат был очищен администратором.",
+            timestamp: Date.now()
+        });
+        return res.json({ status: "Chat Cleared" });
+    }
+    
+    if (action === "unmute") {
+        delete mutedUsers[target];
+        return res.json({ status: "Unmuted", target: target });
+    }
+
+    res.json({ error: "Unknown action" });
 });
+
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
