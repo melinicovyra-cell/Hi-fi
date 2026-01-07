@@ -5,24 +5,36 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+// Включаем доверие к прокси (важно для Render/Heroku/Glitch, чтобы видеть реальный IP)
+app.set('trust proxy', true);
+
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
-// --- КОНФИГУРАЦИЯ ---
-const SERVER_PASSWORD = "hihpikpass"; // Пароль для админ-панели
+// --- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ---
+const SERVER_PASSWORD = "hihpikpass"; // Пароль для админ-команд
 const MAX_HISTORY = 50;
+
+// 1. ПАРОЛИ АДМИНОВ
+const adminSecrets = {
+    "hihpik0": "MySecretKey123", 
+    "BAAAAHHRR": "AdminKey456"
+};
+
+// 2. ЗАПРЕЩЕННЫЕ НИКИ
+const FORBIDDEN_NAMES = [
+    "system", "server", "announcement", "admin", "moderator", "console",
+    "nigga", "nigger", "hitler", "faggot", "sex", "porn"
+];
 
 // --- ХРАНИЛИЩЕ ---
 let globalMessages = [];
 let mutedUsers = new Map();
-let bannedUsers = new Set();
+let bannedUsers = new Set(); // Баны по никам
+let bannedIPs = new Set();   // Баны по IP
 
-// Словарь админов: ИМЯ -> ПЕРСОНАЛЬНЫЙ ПАРОЛЬ (или ключ)
-// Это предотвратит подмену админа обычным игроком
-const adminSecrets = {
-    "hihpik0": "superSecretPass1", 
-    "BAAAAHHRR": "superSecretPass2"
-};
+// Карта соответствия: Ник -> Последний IP (чтобы знать, какой IP банить по нику)
+let userIPMap = new Map();
 
 // --- ЗАЩИТА ---
 const limiter = rateLimit({
@@ -37,10 +49,15 @@ function isAdmin(username) {
     return Object.keys(adminSecrets).includes(username);
 }
 
-// --- ГЛАВНАЯ ---
-app.get('/', (req, res) => res.send("Global Chat Server is Running! v16.1 (SECURED)"));
+// Получение реального IP пользователя
+function getClientIP(req) {
+    return req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+}
 
-// --- ЧАТ ---
+// --- ГЛАВНАЯ ---
+app.get('/', (req, res) => res.send("Global Chat Server SECURED v18.0 (IP BAN ADDED)"));
+
+// --- ПОЛУЧИТЬ ЧАТ ---
 app.get('/chat', (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json(globalMessages);
@@ -50,7 +67,6 @@ app.get('/chat', (req, res) => {
 app.get('/check-role', (req, res) => {
     res.set('Cache-Control', 'no-store'); 
     const player = req.query.player;
-    
     if (isAdmin(player)) {
         res.json({ role: "ADMIN" });
     } else {
@@ -58,25 +74,25 @@ app.get('/check-role', (req, res) => {
     }
 });
 
-// --- ОТПРАВКА (ИСПРАВЛЕНО) ---
+// --- ОТПРАВКА СООБЩЕНИЯ ---
 app.post('/chat', (req, res) => {
-    // secureKey - это то, что клиент должен прислать, если хочет писать от имени админа
-    const { player, message, secureKey } = req.body; 
+    const { player, message, secureKey } = req.body;
+    const clientIP = getClientIP(req); // Получаем IP отправителя
+
+    // 1. ПРОВЕРКА IP БАНА (Самая первая проверка)
+    if (bannedIPs.has(clientIP)) {
+        console.log(`[BLOCK] Request from BANNED IP: ${clientIP}`);
+        return res.status(403).json({ error: "IP BANNED" });
+    }
 
     if (!player || !message) return res.status(400).json({ error: "Missing data" });
-
     const msgStr = String(message).trim();
     if (msgStr.length === 0) return res.status(400).json({ error: "Empty" });
 
-    // 1. ЗАЩИТА ОТ ПОДМЕНЫ АДМИНА
-    if (isAdmin(player)) {
-        // Если кто-то пытается писать под ником админа, но не знает пароль
-        if (secureKey !== adminSecrets[player]) {
-            return res.status(403).json({ error: "Unauthorized: Fake Admin Detected" });
-        }
-    }
+    // Сохраняем IP пользователя для возможности бана в будущем
+    if (player) userIPMap.set(player, clientIP);
 
-    // 2. ПРОВЕРКА БАНА
+    // 2. ПРОВЕРКА БАНА ПО НИКУ
     if (bannedUsers.has(player)) return res.status(403).json({ error: "BANNED" });
 
     // 3. ПРОВЕРКА МУТА
@@ -88,14 +104,28 @@ app.post('/chat', (req, res) => {
         }
     }
 
-    // Сохраняем сообщение
+    // 4. АВТОРИЗАЦИЯ И ФИЛЬТР НИКОВ
+    if (isAdmin(player)) {
+        if (secureKey !== adminSecrets[player]) {
+            console.log(`[SECURITY] Fake admin attempt: ${player} from ${clientIP}`);
+            return res.status(403).json({ error: "Identity Theft Detected" });
+        }
+    } else {
+        const lowerName = player.toLowerCase();
+        const isForbidden = FORBIDDEN_NAMES.some(badWord => lowerName.includes(badWord));
+        
+        if (isForbidden) {
+            console.log(`[SECURITY] Forbidden name attempt: ${player} from ${clientIP}`);
+            return res.status(403).json({ error: "Forbidden Username" });
+        }
+    }
+
     globalMessages.push({
         player,
         msg: msgStr.substring(0, 300),
         timestamp: Date.now(),
         type: "msg",
-        // Добавляем метку, чтобы на клиенте можно было красиво подсветить настоящего админа
-        isAdmin: isAdmin(player) 
+        isAdmin: isAdmin(player)
     });
 
     if (globalMessages.length > MAX_HISTORY) globalMessages.shift();
@@ -106,18 +136,9 @@ app.post('/chat', (req, res) => {
 app.post('/admin', (req, res) => {
     const { password, action, target, duration, text } = req.body;
 
-    // Глобальный пароль сервера для выполнения команд
     if (password !== SERVER_PASSWORD) return res.status(403).json({ error: "Wrong Password" });
 
     switch (action) {
-        case 'promote':
-            // Внимание: динамическое добавление админов в простой схеме сложно без базы данных,
-            // так как нужно генерировать и передавать им пароль. 
-            // Для простоты пока оставим добавление в runtime, но без пароля он не сможет писать как админ.
-            // Лучше добавлять админов вручную в код (в объект adminSecrets).
-            res.json({ error: "Please add admins via source code configuration for security." });
-            return; 
-        
         case 'mute':
             if (target) {
                 mutedUsers.set(target, Date.now() + (duration * 1000));
@@ -126,8 +147,25 @@ app.post('/admin', (req, res) => {
             break;
         case 'ban':
             if (target) {
+                // Баним Ник
                 bannedUsers.add(target);
-                globalMessages.push({ player: "SYSTEM", msg: `🚫 User ${target} has been BANNED.`, timestamp: Date.now(), type: "sys" });
+                
+                // Баним IP, если знаем его
+                if (userIPMap.has(target)) {
+                    const targetIP = userIPMap.get(target);
+                    bannedIPs.add(targetIP);
+                    console.log(`[ADMIN] IP Banned for user ${target}: ${targetIP}`);
+                }
+
+                globalMessages.push({ player: "SYSTEM", msg: `🚫 User ${target} has been BANNED (IP & Name).`, timestamp: Date.now(), type: "sys" });
+            }
+            break;
+        case 'unban': // Новая команда для разбана (если случайно забанил)
+            if (target) {
+                bannedUsers.delete(target);
+                 // При разбане ника IP остаётся в бане для безопасности. 
+                 // Чтобы разбанить IP, нужно перезагрузить сервер (так проще).
+                 globalMessages.push({ player: "SYSTEM", msg: `✅ User ${target} unbanned (Name only).`, timestamp: Date.now(), type: "sys" });
             }
             break;
         case 'kick':
@@ -143,7 +181,7 @@ app.post('/admin', (req, res) => {
             globalMessages.push({ player: "SYSTEM", msg: "🧹 Chat cleared by admin.", timestamp: Date.now(), type: "sys" });
             break;
         default:
-            return res.status(400).json({ error: "Unknown action" });
+            return res.status(400).json({ error: "Unknown Action" });
     }
     res.json({ success: true });
 });
