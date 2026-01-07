@@ -2,6 +2,8 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const app = express();
+
+// Render автоматически выдает порт через process.env.PORT
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
@@ -15,7 +17,7 @@ const MAX_HISTORY = 50;
 let globalMessages = [];
 let mutedUsers = new Map();
 let bannedUsers = new Set();
-// Изначальные админы (можно добавить себя сразу)
+// Изначальные админы
 let adminUsers = new Set(["hihpik0", "BAAAAHHRR"]); 
 
 // --- ЗАЩИТА ---
@@ -26,8 +28,10 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// --- ГЛАВНАЯ ---
-app.get('/', (req, res) => res.send("Chat Server Active v14.2"));
+// --- ГЛАВНАЯ СТРАНИЦА (Индикатор жизни) ---
+app.get('/', (req, res) => {
+    res.send("Global Chat Server is Running! v15.0");
+});
 
 // --- ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
 app.get('/chat', (req, res) => {
@@ -35,7 +39,7 @@ app.get('/chat', (req, res) => {
     res.json(globalMessages);
 });
 
-// --- ПРОВЕРКА РОЛИ (Нужно для Lua скрипта) ---
+// --- ПРОВЕРКА РОЛИ ---
 app.get('/check-role', (req, res) => {
     const player = req.query.player;
     if (adminUsers.has(player)) {
@@ -48,16 +52,33 @@ app.get('/check-role', (req, res) => {
 // --- ОТПРАВКА СООБЩЕНИЙ ---
 app.post('/chat', (req, res) => {
     const { player, message } = req.body;
-    if (!player || !message) return res.status(400).json({ error: "Missing data" });
-    if (String(message).trim().length === 0) return res.status(400).json({ error: "Empty" });
-    if (bannedUsers.has(player)) return res.status(403).json({ error: "BANNED" });
-    if (mutedUsers.has(player) && Date.now() < mutedUsers.get(player)) return res.status(403).json({ error: "MUTED" });
+
+    if (!player || !message) {
+        return res.status(400).json({ error: "Missing data" });
+    }
+
+    const msgStr = String(message).trim();
+    if (msgStr.length === 0) return res.status(400).json({ error: "Empty message" });
+
+    // Проверка банов и мутов
+    if (bannedUsers.has(player)) {
+        return res.status(403).json({ error: "BANNED" });
+    }
+
+    if (mutedUsers.has(player)) {
+        const expiresAt = mutedUsers.get(player);
+        if (Date.now() < expiresAt) {
+            return res.status(403).json({ error: "MUTED" });
+        } else {
+            mutedUsers.delete(player); // Мут истек
+        }
+    }
 
     const newMessage = {
         player,
-        msg: String(message).substring(0, 300),
+        msg: msgStr.substring(0, 300),
         timestamp: Date.now(),
-        type: "msg" // обычное сообщение
+        type: "msg"
     };
 
     globalMessages.push(newMessage);
@@ -66,75 +87,45 @@ app.post('/chat', (req, res) => {
     res.json({ success: true });
 });
 
-// --- АДМИН ПАНЕЛЬ (ОБРАБОТКА КОМАНД) ---
+// --- АДМИН ПАНЕЛЬ ---
 app.post('/admin', (req, res) => {
     const { password, action, target, duration, text } = req.body;
 
-    // Проверка пароля сервера
     if (password !== SERVER_PASSWORD) {
         return res.status(403).json({ error: "Wrong Password" });
     }
 
-    // Логика команд
     switch (action) {
-        case 'promote': // ВЫДАЧА АДМИНКИ
+        case 'promote':
             if (target) {
                 adminUsers.add(target);
-                globalMessages.push({
-                    player: "SYSTEM",
-                    msg: `User ${target} has been promoted to ADMIN!`,
-                    timestamp: Date.now(),
-                    type: "sys"
-                });
+                globalMessages.push({ player: "SYSTEM", msg: `User ${target} promoted to ADMIN!`, timestamp: Date.now(), type: "sys" });
             }
             break;
-
-        case 'demote': // СНЯТИЕ АДМИНКИ
+        case 'demote':
             if (target) {
                 adminUsers.delete(target);
-                 globalMessages.push({
-                    player: "SYSTEM",
-                    msg: `User ${target} is no longer an admin.`,
-                    timestamp: Date.now(),
-                    type: "sys"
-                });
+                globalMessages.push({ player: "SYSTEM", msg: `User ${target} demoted.`, timestamp: Date.now(), type: "sys" });
             }
             break;
-
         case 'mute':
             if (target) mutedUsers.set(target, Date.now() + (duration * 1000));
             break;
-        
         case 'ban':
             if (target) bannedUsers.add(target);
             break;
-
-        case 'kick':
-            // Кик реализуется на клиенте, сервер просто может отправить команду,
-            // но в простой реализации мы просто проигнорируем или добавим во временный бан
-            break;
-
         case 'announce':
-            globalMessages.push({
-                player: "ANNOUNCEMENT",
-                msg: text,
-                timestamp: Date.now(),
-                type: "announce"
-            });
+            globalMessages.push({ player: "ANNOUNCEMENT", msg: text, timestamp: Date.now(), type: "announce" });
             break;
-            
         case 'clear':
             globalMessages = [];
-            globalMessages.push({
-                player: "SYSTEM",
-                msg: "Chat has been cleared by an admin.",
-                timestamp: Date.now(),
-                type: "sys"
-            });
+            globalMessages.push({ player: "SYSTEM", msg: "Chat cleared by admin.", timestamp: Date.now(), type: "sys" });
             break;
     }
-
     res.json({ success: true });
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Запуск с привязкой к 0.0.0.0 для Render
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
+});
