@@ -1,142 +1,140 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
-const cors = require('cors'); // Рекомендую добавить это
+const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors()); // Разрешаем запросы с любых источников
+app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
 // --- КОНФИГУРАЦИЯ ---
-const ADMIN_PASSWORD = "hihpikpass"; 
-const MAX_HISTORY = 50; // Уменьшил до 50 для стабильности (можно вернуть 100)
-const MESSAGE_LENGTH_LIMIT = 300; 
+const SERVER_PASSWORD = "hihpikpass"; 
+const MAX_HISTORY = 50;
 
 // --- ХРАНИЛИЩЕ ---
 let globalMessages = [];
-let mutedUsers = new Map(); 
-let bannedUsers = new Set(); 
-let lastMessageContent = new Map(); 
+let mutedUsers = new Map();
+let bannedUsers = new Set();
+// Изначальные админы (можно добавить себя сразу)
+let adminUsers = new Set(["hihpik0", "BAAAAHHRR"]); 
 
 // --- ЗАЩИТА ---
 const limiter = rateLimit({
-    windowMs: 1 * 60 * 1000, 
-    max: 600, // Поднял лимит для активного чата
+    windowMs: 1 * 60 * 1000,
+    max: 600,
     message: { error: "Too many requests" }
 });
 app.use(limiter);
 
-// --- ГЛАВНАЯ СТРАНИЦА (Проверка жизни) ---
-app.get('/', (req, res) => {
-    res.send("Global Chat Server is Running! v11.0");
-});
+// --- ГЛАВНАЯ ---
+app.get('/', (req, res) => res.send("Chat Server Active v14.2"));
 
 // --- ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
 app.get('/chat', (req, res) => {
-    // Чтобы не кэшировалось браузером/прокси
     res.set('Cache-Control', 'no-store');
     res.json(globalMessages);
+});
+
+// --- ПРОВЕРКА РОЛИ (Нужно для Lua скрипта) ---
+app.get('/check-role', (req, res) => {
+    const player = req.query.player;
+    if (adminUsers.has(player)) {
+        res.json({ role: "ADMIN" });
+    } else {
+        res.json({ role: "USER" });
+    }
 });
 
 // --- ОТПРАВКА СООБЩЕНИЙ ---
 app.post('/chat', (req, res) => {
     const { player, message } = req.body;
+    if (!player || !message) return res.status(400).json({ error: "Missing data" });
+    if (String(message).trim().length === 0) return res.status(400).json({ error: "Empty" });
+    if (bannedUsers.has(player)) return res.status(403).json({ error: "BANNED" });
+    if (mutedUsers.has(player) && Date.now() < mutedUsers.get(player)) return res.status(403).json({ error: "MUTED" });
 
-    // 1. Простая Валидация
-    if (!player || !message) {
-        return res.status(400).json({ error: "Missing data" });
-    }
-
-    const msgStr = String(message).trim();
-    if (msgStr.length === 0) return res.status(400).json({ error: "Empty message" });
-
-    // 2. Бан
-    if (bannedUsers.has(player)) {
-        return res.status(403).json({ error: "BANNED" });
-    }
-
-    // 3. Мут
-    if (mutedUsers.has(player)) {
-        const expiresAt = mutedUsers.get(player);
-        if (Date.now() < expiresAt) {
-            return res.status(403).json({ error: "MUTED" });
-        } else {
-            mutedUsers.delete(player);
-        }
-    }
-
-    // 4. Анти-Спам (Только если сообщение точно такое же как прошлое)
-    if (!msgStr.startsWith("||SYNC_")) {
-        if (lastMessageContent.get(player) === msgStr) {
-            // Возвращаем 200, но не добавляем сообщение (Silent Fail), чтобы не крашить скрипт
-            console.log(`[SPAM BLOCKED] ${player}: ${msgStr}`);
-            return res.json({ status: "ignored_spam" });
-        }
-        lastMessageContent.set(player, msgStr);
-    }
-
-    // 5. Добавление
-    const finalMessage = msgStr.substring(0, MESSAGE_LENGTH_LIMIT);
-    
-    const msgObj = {
-        type: "msg",
-        player: player,
-        msg: finalMessage,
-        timestamp: Date.now()
+    const newMessage = {
+        player,
+        msg: String(message).substring(0, 300),
+        timestamp: Date.now(),
+        type: "msg" // обычное сообщение
     };
 
-    globalMessages.push(msgObj);
+    globalMessages.push(newMessage);
+    if (globalMessages.length > MAX_HISTORY) globalMessages.shift();
 
-    // 6. ИСПРАВЛЕННАЯ ОБРЕЗКА (Оставляем последние N сообщений)
-    if (globalMessages.length > MAX_HISTORY) {
-        // slice(-N) берет последние N элементов. Это надежнее.
-        globalMessages = globalMessages.slice(-MAX_HISTORY);
-    }
-
-    console.log(`[CHAT] ${player}: ${finalMessage} (Total: ${globalMessages.length})`);
-    res.json({ status: "success" });
+    res.json({ success: true });
 });
 
-// --- АДМИНКА ---
+// --- АДМИН ПАНЕЛЬ (ОБРАБОТКА КОМАНД) ---
 app.post('/admin', (req, res) => {
     const { password, action, target, duration, text } = req.body;
 
-    if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: "Wrong Password" });
-
-    const sysMsg = (txt) => ({ type: "sys", msg: txt, timestamp: Date.now() });
-
-    try {
-        switch (action) {
-            case "announce":
-                globalMessages.push({ type: "announce", player: "SYSTEM", msg: text, timestamp: Date.now() });
-                break;
-            case "mute":
-                mutedUsers.set(target, Date.now() + ((duration || 60) * 1000));
-                globalMessages.push(sysMsg(`🔇 ${target} muted.`));
-                break;
-            case "ban":
-                bannedUsers.add(target);
-                globalMessages.push(sysMsg(`🚫 ${target} BANNED.`));
-                break;
-            case "kick":
-                globalMessages.push({ type: "cmd", cmd: "kick", target: target, timestamp: Date.now() });
-                globalMessages.push(sysMsg(`🦵 ${target} kicked.`));
-                break;
-            case "clear":
-                globalMessages = [];
-                globalMessages.push(sysMsg("🧹 Chat cleared."));
-                break;
-        }
-        res.json({ status: "Success" });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: "Internal Error" });
+    // Проверка пароля сервера
+    if (password !== SERVER_PASSWORD) {
+        return res.status(403).json({ error: "Wrong Password" });
     }
+
+    // Логика команд
+    switch (action) {
+        case 'promote': // ВЫДАЧА АДМИНКИ
+            if (target) {
+                adminUsers.add(target);
+                globalMessages.push({
+                    player: "SYSTEM",
+                    msg: `User ${target} has been promoted to ADMIN!`,
+                    timestamp: Date.now(),
+                    type: "sys"
+                });
+            }
+            break;
+
+        case 'demote': // СНЯТИЕ АДМИНКИ
+            if (target) {
+                adminUsers.delete(target);
+                 globalMessages.push({
+                    player: "SYSTEM",
+                    msg: `User ${target} is no longer an admin.`,
+                    timestamp: Date.now(),
+                    type: "sys"
+                });
+            }
+            break;
+
+        case 'mute':
+            if (target) mutedUsers.set(target, Date.now() + (duration * 1000));
+            break;
+        
+        case 'ban':
+            if (target) bannedUsers.add(target);
+            break;
+
+        case 'kick':
+            // Кик реализуется на клиенте, сервер просто может отправить команду,
+            // но в простой реализации мы просто проигнорируем или добавим во временный бан
+            break;
+
+        case 'announce':
+            globalMessages.push({
+                player: "ANNOUNCEMENT",
+                msg: text,
+                timestamp: Date.now(),
+                type: "announce"
+            });
+            break;
+            
+        case 'clear':
+            globalMessages = [];
+            globalMessages.push({
+                player: "SYSTEM",
+                msg: "Chat has been cleared by an admin.",
+                timestamp: Date.now(),
+                type: "sys"
+            });
+            break;
+    }
+
+    res.json({ success: true });
 });
 
-// Очистка памяти каждые 5 минут
-setInterval(() => {
-    lastMessageContent.clear();
-}, 5 * 60 * 1000);
-
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
