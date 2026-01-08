@@ -5,183 +5,266 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Включаем доверие к прокси (важно для Render/Heroku/Glitch, чтобы видеть реальный IP)
-app.set('trust proxy', true);
+// --- 1. БЕЗОПАСНОСТЬ И НАСТРОЙКИ ---
+app.disable('x-powered-by'); 
+app.set('trust proxy', 1); // Обязательно для получения реального IP на Render
 
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
-// --- КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ---
-const SERVER_PASSWORD = "hihpikpass"; // Пароль для админ-команд
-const MAX_HISTORY = 50;
+// Защита от кривого JSON
+app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+        return res.status(400).json({ error: "Bad JSON" });
+    }
+    next();
+});
 
-// 1. ПАРОЛИ АДМИНОВ
+// --- 2. КОНФИГУРАЦИЯ ---
+const SERVER_PASSWORD = process.env.SERVER_PASSWORD || "hihpikpass"; 
+const MAX_HISTORY = 70;
+const CREATOR_NAME = "hihpik0"; // Имя Создателя (Неуязвимый)
+
 const adminSecrets = {
-    "hihpik0": "MySecretKey123", 
-    "BAAAAHHRR": "AdminKey456"
+    "hihpik0": process.env.ADMIN_KEY_1 || "MySecretKey123", 
+    "BAAAAHHRR": process.env.ADMIN_KEY_2 || "AdminKey456"
 };
 
-// 2. ЗАПРЕЩЕННЫЕ НИКИ
-const FORBIDDEN_NAMES = [
-    "system", "server", "announcement", "admin", "moderator", "console",
-    "nigga", "nigger", "hitler", "faggot", "sex", "porn"
+const FORBIDDEN_WORDS = [
+    "system", "server", "announcement", "admin", "moderator", "root",
+    "nigga", "nigger", "hitler", "faggot", "sex", "porn", "xxx", "child", "rape"
 ];
 
-// --- ХРАНИЛИЩЕ ---
+// --- 3. ХРАНИЛИЩЕ ДАННЫХ (RAM) ---
 let globalMessages = [];
 let mutedUsers = new Map();
-let bannedUsers = new Set(); // Баны по никам
-let bannedIPs = new Set();   // Баны по IP
+let bannedUsers = new Set();
+let bannedIPs = new Set();
+let userInfoMap = new Map(); 
 
-// Карта соответствия: Ник -> Последний IP (чтобы знать, какой IP банить по нику)
-let userIPMap = new Map();
+// Анти-спам
+let lastMessageTime = new Map();
 
-// --- ЗАЩИТА ---
-const limiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
-    max: 600,
-    message: { error: "Too many requests" }
+// --- 4. RATE LIMITERS ---
+const readLimiter = rateLimit({
+    windowMs: 60 * 1000, max: 200, 
+    message: { error: "Too many reads" }
 });
-app.use(limiter);
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-function isAdmin(username) {
-    return Object.keys(adminSecrets).includes(username);
-}
+const writeLimiter = rateLimit({
+    windowMs: 10 * 1000, max: 10, // Чуть поднял лимит
+    message: { error: "Spam detected. Slow down." }
+});
 
-// Получение реального IP пользователя
+// --- 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+function isAdmin(username) { return Object.keys(adminSecrets).includes(username); }
+
 function getClientIP(req) {
-    return req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    // Получаем реальный IP через заголовки прокси
+    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    // Если IP несколько (через запятую), берем первый
+    if (ip && ip.includes(',')) return ip.split(',')[0].trim();
+    return ip;
 }
 
-// --- ГЛАВНАЯ ---
-app.get('/', (req, res) => res.send("Global Chat Server SECURED v18.0 (IP BAN ADDED)"));
+function sanitize(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').trim();
+}
 
-// --- ПОЛУЧИТЬ ЧАТ ---
-app.get('/chat', (req, res) => {
+function updateUserInfo(player, ip, userAgent) {
+    userInfoMap.set(player, {
+        ip: ip,
+        userAgent: userAgent || "Unknown",
+        lastSeen: Date.now(),
+        isBanned: bannedUsers.has(player),
+        isMuted: mutedUsers.has(player)
+    });
+}
+
+// --- 6. МАРШРУТЫ ---
+
+app.get('/', (req, res) => res.send("🛡️ Secure Chat v21.0 (God Mode Active)"));
+
+// ПУБЛИЧНЫЙ ЧАТ
+app.get('/chat', readLimiter, (req, res) => {
     res.set('Cache-Control', 'no-store');
-    res.json(globalMessages);
+    // Отправляем чат без IP для безопасности игроков
+    const safeMessages = globalMessages.map(msg => ({
+        player: msg.player,
+        msg: msg.msg,
+        timestamp: msg.timestamp,
+        type: msg.type,
+        isAdmin: msg.isAdmin
+    }));
+    res.json(safeMessages);
 });
 
-// --- ПРОВЕРКА РОЛИ ---
-app.get('/check-role', (req, res) => {
+// ПРОВЕРКА РОЛИ
+app.get('/check-role', readLimiter, (req, res) => {
     res.set('Cache-Control', 'no-store'); 
     const player = req.query.player;
-    if (isAdmin(player)) {
-        res.json({ role: "ADMIN" });
-    } else {
-        res.json({ role: "USER" });
-    }
+    if (player && isAdmin(player)) res.json({ role: "ADMIN" });
+    else res.json({ role: "USER" });
 });
 
-// --- ОТПРАВКА СООБЩЕНИЯ ---
-app.post('/chat', (req, res) => {
+// ОТПРАВКА СООБЩЕНИЯ
+app.post('/chat', writeLimiter, (req, res) => {
     const { player, message, secureKey } = req.body;
-    const clientIP = getClientIP(req); // Получаем IP отправителя
+    const clientIP = getClientIP(req);
+    const userAgent = req.get('User-Agent');
 
-    // 1. ПРОВЕРКА IP БАНА (Самая первая проверка)
-    if (bannedIPs.has(clientIP)) {
-        console.log(`[BLOCK] Request from BANNED IP: ${clientIP}`);
-        return res.status(403).json({ error: "IP BANNED" });
-    }
+    // === ЛОГИРОВАНИЕ В КОНСОЛЬ RENDER ===
+    // Это увидит только владелец в логах
+    console.log(`[MSG] ${player} (IP: ${clientIP}): ${message.substring(0, 50)}`);
 
-    if (!player || !message) return res.status(400).json({ error: "Missing data" });
-    const msgStr = String(message).trim();
-    if (msgStr.length === 0) return res.status(400).json({ error: "Empty" });
-
-    // Сохраняем IP пользователя для возможности бана в будущем
-    if (player) userIPMap.set(player, clientIP);
-
-    // 2. ПРОВЕРКА БАНА ПО НИКУ
+    // 1. БАНЫ
+    if (bannedIPs.has(clientIP)) return res.status(403).json({ error: "IP BANNED" });
     if (bannedUsers.has(player)) return res.status(403).json({ error: "BANNED" });
 
-    // 3. ПРОВЕРКА МУТА
+    // 2. ВАЛИДАЦИЯ
+    if (!player || !message) return res.status(400).json({ error: "No data" });
+
+    // 3. СБОР ИНФЫ
+    updateUserInfo(player, clientIP, userAgent);
+
+    // 4. МУТ
     if (mutedUsers.has(player)) {
-        if (Date.now() < mutedUsers.get(player)) {
-            return res.status(403).json({ error: "MUTED" });
-        } else {
-            mutedUsers.delete(player);
-        }
+        if (Date.now() < mutedUsers.get(player)) return res.status(403).json({ error: "MUTED" });
+        else mutedUsers.delete(player);
     }
 
-    // 4. АВТОРИЗАЦИЯ И ФИЛЬТР НИКОВ
+    // 5. АНТИ-СПАМ (Кроме админов)
+    if (!isAdmin(player)) {
+        const now = Date.now();
+        if (lastMessageTime.has(player) && (now - lastMessageTime.get(player) < 1000)) {
+            return res.status(429).json({ error: "Too fast" });
+        }
+        lastMessageTime.set(player, now);
+    }
+
+    // 6. АВТОРИЗАЦИЯ
     if (isAdmin(player)) {
         if (secureKey !== adminSecrets[player]) {
-            console.log(`[SECURITY] Fake admin attempt: ${player} from ${clientIP}`);
-            return res.status(403).json({ error: "Identity Theft Detected" });
+            console.warn(`[SECURITY] Fake Admin Attempt: ${player} IP: ${clientIP}`);
+            return res.status(403).json({ error: "Fake Admin" });
         }
     } else {
-        const lowerName = player.toLowerCase();
-        const isForbidden = FORBIDDEN_NAMES.some(badWord => lowerName.includes(badWord));
-        
-        if (isForbidden) {
-            console.log(`[SECURITY] Forbidden name attempt: ${player} from ${clientIP}`);
-            return res.status(403).json({ error: "Forbidden Username" });
-        }
+        const lower = player.toLowerCase();
+        if (FORBIDDEN_WORDS.some(w => lower.includes(w))) return res.status(403).json({ error: "Bad Name" });
+        if (player.length > 20 || message.length > 300) return res.status(400).json({ error: "Limit Exceeded" });
     }
 
+    // 7. СОХРАНЕНИЕ
+    const safeMsg = sanitize(message);
+    if (!safeMsg) return res.status(400).json({ error: "Empty" });
+
     globalMessages.push({
-        player,
-        msg: msgStr.substring(0, 300),
+        player: sanitize(player),
+        msg: safeMsg,
         timestamp: Date.now(),
         type: "msg",
-        isAdmin: isAdmin(player)
+        isAdmin: isAdmin(player),
+        ip: clientIP // Сохраняем IP внутри памяти
     });
 
     if (globalMessages.length > MAX_HISTORY) globalMessages.shift();
     res.json({ success: true });
 });
 
-// --- АДМИН КОМАНДЫ ---
+// АДМИН ПАНЕЛЬ
 app.post('/admin', (req, res) => {
     const { password, action, target, duration, text } = req.body;
+    const adminIP = getClientIP(req);
 
-    if (password !== SERVER_PASSWORD) return res.status(403).json({ error: "Wrong Password" });
+    if (password !== SERVER_PASSWORD) {
+        console.warn(`[AUTH FAIL] IP: ${adminIP}`);
+        return res.status(403).json({ error: "Wrong Password" });
+    }
+
+    // === GOD MODE PROTECTION ===
+    // Если целью действия является Создатель, отменяем действие
+    if (target === CREATOR_NAME) {
+        // Разрешаем только 'info', остальные карательные меры запрещены
+        if (action === 'ban' || action === 'kick' || action === 'mute') {
+            console.log(`[GOD MODE] Attempt to ${action} CREATOR by IP: ${adminIP}. BLOCKED.`);
+            // Отправляем в чат сообщение о том, что кто-то офигел, но действие не выполняем
+            return res.json({ success: false, error: "YOU CANNOT BAN THE CREATOR!" });
+        }
+    }
 
     switch (action) {
+        case 'info':
+            if (target && userInfoMap.has(target)) {
+                const info = userInfoMap.get(target);
+                return res.json({ 
+                    success: true, 
+                    data: {
+                        username: target,
+                        ip: info.ip,
+                        userAgent: info.userAgent,
+                        lastSeen: new Date(info.lastSeen).toLocaleString(),
+                        status: info.isBanned ? "BANNED" : (info.isMuted ? "MUTED" : "ACTIVE")
+                    } 
+                });
+            } else {
+                return res.json({ success: false, error: "User not found in cache" });
+            }
+            break;
+
+        case 'ban':
+            if (target) {
+                bannedUsers.add(target);
+                if (userInfoMap.has(target)) {
+                    const ipToBan = userInfoMap.get(target).ip;
+                    bannedIPs.add(ipToBan);
+                    console.log(`[BAN] User: ${target} | IP: ${ipToBan} | By Admin IP: ${adminIP}`);
+                }
+                globalMessages.push({ 
+                    player: "SYSTEM", 
+                    msg: `🚫 User ${sanitize(target)} BANNED.`, 
+                    timestamp: Date.now(), 
+                    type: "sys"
+                });
+            }
+            break;
+
+        case 'announce':
+            if(text) {
+                console.log(`[ANNOUNCE] From Admin IP ${adminIP}: ${text}`);
+                globalMessages.push({ 
+                    player: "ANNOUNCEMENT", 
+                    msg: sanitize(text), 
+                    timestamp: Date.now(), 
+                    type: "announce",
+                });
+            }
+            break;
+            
         case 'mute':
             if (target) {
                 mutedUsers.set(target, Date.now() + (duration * 1000));
-                globalMessages.push({ player: "SYSTEM", msg: `🔇 User ${target} muted for ${duration/60} minutes.`, timestamp: Date.now(), type: "sys" });
+                globalMessages.push({ player: "SYSTEM", msg: `🔇 User ${sanitize(target)} muted.`, timestamp: Date.now(), type: "sys" });
             }
             break;
-        case 'ban':
-            if (target) {
-                // Баним Ник
-                bannedUsers.add(target);
-                
-                // Баним IP, если знаем его
-                if (userIPMap.has(target)) {
-                    const targetIP = userIPMap.get(target);
-                    bannedIPs.add(targetIP);
-                    console.log(`[ADMIN] IP Banned for user ${target}: ${targetIP}`);
-                }
-
-                globalMessages.push({ player: "SYSTEM", msg: `🚫 User ${target} has been BANNED (IP & Name).`, timestamp: Date.now(), type: "sys" });
-            }
+            
+        case 'kick':
+            if (target) globalMessages.push({ player: "SYSTEM", msg: `🦵 User ${sanitize(target)} KICKED.`, timestamp: Date.now(), type: "sys" });
             break;
-        case 'unban': // Новая команда для разбана (если случайно забанил)
+            
+        case 'unban':
             if (target) {
                 bannedUsers.delete(target);
-                 // При разбане ника IP остаётся в бане для безопасности. 
-                 // Чтобы разбанить IP, нужно перезагрузить сервер (так проще).
-                 globalMessages.push({ player: "SYSTEM", msg: `✅ User ${target} unbanned (Name only).`, timestamp: Date.now(), type: "sys" });
+                globalMessages.push({ player: "SYSTEM", msg: `✅ User ${sanitize(target)} unbanned.`, timestamp: Date.now(), type: "sys" });
             }
             break;
-        case 'kick':
-            if (target) {
-                globalMessages.push({ player: "SYSTEM", msg: `🦵 User ${target} has been KICKED.`, timestamp: Date.now(), type: "sys" });
-            }
-            break;
-        case 'announce':
-            globalMessages.push({ player: "ANNOUNCEMENT", msg: text, timestamp: Date.now(), type: "announce" });
-            break;
+
         case 'clear':
             globalMessages = [];
-            globalMessages.push({ player: "SYSTEM", msg: "🧹 Chat cleared by admin.", timestamp: Date.now(), type: "sys" });
+            globalMessages.push({ player: "SYSTEM", msg: "🧹 Chat cleared.", timestamp: Date.now(), type: "sys" });
             break;
-        default:
-            return res.status(400).json({ error: "Unknown Action" });
+
+        default: return res.status(400).json({ error: "Unknown Action" });
     }
     res.json({ success: true });
 });
