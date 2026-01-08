@@ -9,10 +9,11 @@ const PORT = process.env.PORT || 3000;
 
 // --- 1. БЕЗОПАСНОСТЬ И НАСТРОЙКИ ---
 
-// ВАШ СЕКРЕТНЫЙ КЛЮЧ
+// ВАШ СЕКРЕТНЫЙ КЛЮЧ (Должен совпадать с Lua скриптом)
 const GAME_API_KEY = process.env.GAME_API_KEY || "hihpik0oikopy"; 
 
-const SERVER_PASSWORD = process.env.SERVER_PASSWORD || "hihpikpass"; 
+// ИСПРАВЛЕНО: Пароль изменен на spirithih0, чтобы совпадать с Lua скриптом
+const SERVER_PASSWORD = process.env.SERVER_PASSWORD || "spirithih0"; 
 const CREATOR_NAME = "hihpik0";
 
 // Базовая защита
@@ -115,7 +116,7 @@ function updateUserInfo(player, ip, userAgent) {
 
 // --- 6. МАРШРУТЫ ---
 
-app.get('/', (req, res) => res.send("🛡️ Secure Chat v2.1 (Key Protected)"));
+app.get('/', (req, res) => res.send("🛡️ Secure Chat v2.2 (Password Fixed)"));
 
 // ЧТЕНИЕ ЧАТА
 app.get('/chat', readLimiter, (req, res) => {
@@ -190,11 +191,17 @@ app.post('/admin', (req, res) => {
     const { password, action, target, duration, text } = req.body;
     const adminIP = getClientIP(req);
 
-    if (password !== SERVER_PASSWORD) return res.status(403).json({ error: "Wrong Password" });
+    // Логирование попыток входа
+    if (password !== SERVER_PASSWORD) {
+        console.warn(`[ADMIN FAIL] Wrong Password from IP: ${adminIP}`);
+        return res.status(403).json({ error: "Wrong Password" });
+    }
 
     if (target === CREATOR_NAME && ['ban', 'kick', 'mute'].includes(action)) {
         return res.json({ success: false, error: "GOD MODE: Cannot touch Creator." });
     }
+
+    console.log(`[ADMIN ACTION] ${action} on ${target} by IP: ${adminIP}`);
 
     switch (action) {
         case 'info':
