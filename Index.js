@@ -26,7 +26,7 @@ const MAX_HISTORY = 70;
 const CREATOR_NAME = "hihpik0"; // Имя Создателя (Неуязвимый)
 
 const adminSecrets = {
-    "hihpik0": process.env.ADMIN_KEY_1 || "MySecretKey123", 
+    "hihpik0": process.env.ADMIN_KEY_1 || "spirithih0", 
     "BAAAAHHRR": process.env.ADMIN_KEY_2 || "AdminKey456"
 };
 
