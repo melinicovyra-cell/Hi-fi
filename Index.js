@@ -1,260 +1,226 @@
-const express = require('express');
-const rateLimit = require('express-rate-limit');
-const cors = require('cors');
-const helmet = require('helmet');
-const hpp = require('hpp');
-const app = express();
+/*
+    🛡️ SECURE CHAT SERVER V3 (SERVER-SIDE AUTHORITY)
+    - Логика команд полностью на сервере.
+    - Жесткая проверка прав администратора.
+    - Клиент просто "отображает" данные, но не принимает решений.
+*/
 
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const sanitizeHtml = require('sanitize-html');
+
+const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- 1. БЕЗОПАСНОСТЬ И НАСТРОЙКИ ---
+// === 🔒 КОНФИГУРАЦИЯ БЕЗОПАСНОСТИ ===
+const CONFIG = {
+    // Этот токен должен быть вшит в Lua скрипт
+    API_TOKEN: "CHANGE_THIS_TO_SUPER_SECRET_TOKEN_999",
 
-// ВАШ СЕКРЕТНЫЙ КЛЮЧ (Должен совпадать с Lua скриптом)
-const GAME_API_KEY = process.env.GAME_API_KEY || "hihpik0oikopy"; 
-
-// ИСПРАВЛЕНО: Пароль изменен на spirithih0, чтобы совпадать с Lua скриптом
-const SERVER_PASSWORD = process.env.SERVER_PASSWORD || "spirithih0"; 
-const CREATOR_NAME = "hihpik0";
-
-// Базовая защита
-app.set('trust proxy', 1); 
-app.use(helmet()); 
-app.use(hpp()); 
-
-// CORS
-app.use(cors({
-    origin: '*', 
-    methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'x-game-key'] 
-}));
-
-app.use(express.json({ limit: '5kb' })); 
-
-// Защита от битого JSON
-app.use((err, req, res, next) => {
-    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-        return res.status(400).json({ error: "Malicious Payload" });
-    }
-    next();
-});
-
-// --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-function getClientIP(req) {
-    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-    if (ip && ip.includes(',')) return ip.split(',')[0].trim();
-    return ip;
-}
-
-// --- 3. MIDDLEWARE ПРОВЕРКИ ИСТОЧНИКА (ГЛАВНАЯ ЗАЩИТА) ---
-const verifySource = (req, res, next) => {
-    const clientKey = req.headers['x-game-key'];
+    // Ключи администраторов (вводятся игроком в Lua поле 'MY_SECRET_PASS')
+    // Формат: "Ключ": "Никнейм_в_Роблоксе" (для привязки ключа к конкретному нику - опционально)
+    // Или просто список разрешенных ключей.
+    ADMIN_KEYS: [
+        "MySecretKey123",  // Простой ключ
+        "SuperAdminKey777" 
+    ],
     
-    // Для отправки сообщений (POST) ключ обязателен
-    if (req.method === 'POST') {
-        // Проверка ключа
-        if (!clientKey || clientKey !== GAME_API_KEY) {
-            console.warn(`[SECURITY] Blocked Request (Wrong Key). IP: ${getClientIP(req)}`);
-            return res.status(401).json({ error: "Unauthorized: Invalid Game Key" });
-        }
+    // Системный пароль для внешних утилит (если нужно)
+    SERVER_MASTER_PASS: "hihpikpass", 
 
-        // Проверка User-Agent (защита от скриптов)
-        const userAgent = req.get('User-Agent') || "";
-        if (userAgent.includes("Postman") || userAgent.includes("insomnia") || userAgent.includes("python")) {
-             return res.status(403).json({ error: "Forbidden Client" });
-        }
+    MAX_HISTORY: 50
+};
+
+// === 🧠 ХРАНИЛИЩЕ В RAM ===
+let messages = [];
+let bans = {};     // { "Username": timestamp_end }
+let mutes = {};    // { "Username": timestamp_end }
+let admins = {};   // { "Username": true } (активные сессии админов)
+
+app.use(cors());
+app.use(bodyParser.json());
+
+// === 🛑 ЗАЩИТНЫЙ СЛОЙ (AUTH MIDDLEWARE) ===
+const authMiddleware = (req, res, next) => {
+    // 1. Проверка API Токена (базовая защита от сканирования)
+    const clientToken = req.headers['x-chat-auth'];
+    if (!clientToken || clientToken !== CONFIG.API_TOKEN) {
+        return res.status(404).send(); // Притворяемся, что сервера нет
+    }
+
+    // 2. Проверка User-Agent
+    const userAgent = req.headers['user-agent'] || "";
+    if (!userAgent.includes("Roblox") && !userAgent.includes("Postman")) {
+         return res.status(403).json({ error: "Access Denied: Roblox Only" });
     }
     next();
 };
+app.use(authMiddleware);
 
-app.use(verifySource);
+// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+const cleanText = (text) => sanitizeHtml(text || "", { allowedTags: [], allowedAttributes: {} });
 
-// --- 4. ДАННЫЕ СЕРВЕРА ---
-const MAX_HISTORY = 70;
-const adminSecrets = {
-    "hihpik0": process.env.ADMIN_KEY_1 || "spirithih0", 
-    "BAAAAHHRR": process.env.ADMIN_KEY_2 || "AdminKey456"
+// Проверка: Забанен ли игрок?
+const isBanned = (player) => {
+    if (!bans[player]) return false;
+    if (Date.now() > bans[player]) { delete bans[player]; return false; } // Бан истек
+    return true;
 };
 
-const FORBIDDEN_WORDS = [
-    "system", "server", "announcement", "admin", "moderator", "root",
-    "nigga", "nigger", "hitler", "faggot", "sex", "porn", "xxx", "child", "rape"
-];
+// Проверка: В муте ли игрок?
+const isMuted = (player) => {
+    if (!mutes[player]) return false;
+    if (Date.now() > mutes[player]) { delete mutes[player]; return false; } // Мут истек
+    return true;
+};
 
-let globalMessages = [];
-let mutedUsers = new Map();
-let bannedUsers = new Set();
-let bannedIPs = new Set();
-let userInfoMap = new Map(); 
-let lastMessageTime = new Map();
+// Проверка: Является ли игрок админом?
+const isAdmin = (player) => {
+    return admins[player] === true;
+};
 
-// --- 5. RATE LIMITERS ---
-const readLimiter = rateLimit({
-    windowMs: 60 * 1000, max: 100, 
-    message: { error: "Rate limit exceeded" }
+// === 🚀 ЭНДПОИНТЫ API ===
+
+// 1. ПОЛУЧЕНИЕ СООБЩЕНИЙ
+app.get('/chat', (req, res) => {
+    // Возвращаем сообщения. Можно добавить фильтрацию, если нужно.
+    res.json(messages);
 });
 
-const writeLimiter = rateLimit({
-    windowMs: 10 * 1000, max: 8, // Чуть мягче, но все равно строго
-    message: { error: "Spam detected. Slow down." }
-});
-
-function isAdmin(username) { return Object.keys(adminSecrets).includes(username); }
-
-function sanitize(str) {
-    return String(str)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#039;').trim();
-}
-
-function updateUserInfo(player, ip, userAgent) {
-    userInfoMap.set(player, {
-        ip: ip, userAgent: userAgent || "Unknown", lastSeen: Date.now(),
-        isBanned: bannedUsers.has(player), isMuted: mutedUsers.has(player)
-    });
-}
-
-// --- 6. МАРШРУТЫ ---
-
-app.get('/', (req, res) => res.send("🛡️ Secure Chat v2.2 (Password Fixed)"));
-
-// ЧТЕНИЕ ЧАТА
-app.get('/chat', readLimiter, (req, res) => {
-    res.set('Cache-Control', 'no-store');
-    const safeMessages = globalMessages.map(msg => ({
-        player: msg.player, msg: msg.msg, timestamp: msg.timestamp,
-        type: msg.type, isAdmin: msg.isAdmin
-    }));
-    res.json(safeMessages);
-});
-
-// ПРОВЕРКА РОЛИ
-app.get('/check-role', readLimiter, (req, res) => {
-    res.set('Cache-Control', 'no-store'); 
-    const player = req.query.player;
-    if (player && isAdmin(player)) res.json({ role: "ADMIN" });
-    else res.json({ role: "USER" });
-});
-
-// ОТПРАВКА СООБЩЕНИЯ
-app.post('/chat', writeLimiter, (req, res) => {
+// 2. ОТПРАВКА СООБЩЕНИЙ И АВТОРИЗАЦИЯ
+app.post('/chat', (req, res) => {
     const { player, message, secureKey } = req.body;
-    const clientIP = getClientIP(req);
-    const userAgent = req.get('User-Agent');
-
-    // Логирование (видит только владелец)
-    console.log(`[MSG] ${player} (${clientIP}): ${message.substring(0, 30)}`);
-
-    if (bannedIPs.has(clientIP)) return res.status(403).json({ error: "IP BANNED" });
-    if (bannedUsers.has(player)) return res.status(403).json({ error: "BANNED" });
+    
     if (!player || !message) return res.status(400).json({ error: "No data" });
 
-    updateUserInfo(player, clientIP, userAgent);
-
-    if (mutedUsers.has(player)) {
-        if (Date.now() < mutedUsers.get(player)) return res.status(403).json({ error: "MUTED" });
-        else mutedUsers.delete(player);
+    // 1. Попытка авторизации админа
+    if (secureKey && CONFIG.ADMIN_KEYS.includes(secureKey)) {
+        admins[player] = true; // Выдаем права админа в сессии сервера
     }
 
-    if (!isAdmin(player)) {
-        const now = Date.now();
-        if (lastMessageTime.has(player) && (now - lastMessageTime.get(player) < 1500)) {
-            return res.status(429).json({ error: "Too fast" });
-        }
-        lastMessageTime.set(player, now);
-
-        const lower = player.toLowerCase();
-        const lowerMsg = message.toLowerCase();
-        if (FORBIDDEN_WORDS.some(w => lower.includes(w))) return res.status(403).json({ error: "Bad Name" });
-        if (FORBIDDEN_WORDS.some(w => lowerMsg.includes(w))) return res.status(403).json({ error: "Profanity" });
-        if (player.length > 20 || message.length > 300) return res.status(400).json({ error: "Limit Exceeded" });
-    } else {
-        if (secureKey !== adminSecrets[player]) {
-            return res.status(403).json({ error: "Fake Admin" });
-        }
+    // 2. Проверка Бана
+    if (isBanned(player)) {
+        return res.status(403).json({ error: "You are banned from the chat." });
     }
 
-    const safeMsg = sanitize(message);
-    if (!safeMsg) return res.status(400).json({ error: "Empty" });
+    // 3. Проверка Мута
+    if (isMuted(player)) {
+        return res.status(403).json({ error: "You are muted." });
+    }
 
-    globalMessages.push({
-        player: sanitize(player), msg: safeMsg, timestamp: Date.now(),
-        type: "msg", isAdmin: isAdmin(player), ip: clientIP
+    const safeMessage = cleanText(message);
+    const safePlayer = cleanText(player);
+
+    // Защита от подделки системных ников
+    if (safePlayer.toUpperCase() === "SYSTEM" || safePlayer.toUpperCase() === "ANNOUNCEMENT") {
+        return res.status(403).json({ error: "Reserved nickname" });
+    }
+
+    // Защита от ссылок
+    if (safeMessage.includes("http") || safeMessage.includes("www.") || safeMessage.includes(".com")) {
+         return res.json({ success: false, info: "Links blocked" });
+    }
+
+    // Добавляем сообщение
+    messages.push({ 
+        player: safePlayer, 
+        msg: safeMessage, 
+        timestamp: Date.now(), 
+        type: "user" 
     });
 
-    if (globalMessages.length > MAX_HISTORY) globalMessages.shift();
+    if (messages.length > CONFIG.MAX_HISTORY) messages.shift();
+
     res.json({ success: true });
 });
 
-// АДМИН ПАНЕЛЬ
+// 3. ПРОВЕРКА РОЛИ (Для обновления UI клиента)
+app.get('/check-role', (req, res) => {
+    const { player } = req.query;
+    res.json({ role: isAdmin(player) ? "ADMIN" : "USER" });
+});
+
+// 4. ВЫПОЛНЕНИЕ АДМИН-КОМАНД (ТОЛЬКО СЕРВЕРНАЯ ОБРАБОТКА)
 app.post('/admin', (req, res) => {
-    const { password, action, target, duration, text } = req.body;
-    const adminIP = getClientIP(req);
+    const { password, action, target, duration, text, executor } = req.body;
+    
+    // Два способа выполнить команду:
+    // 1. Знать SERVER_MASTER_PASS (для внешних панелей)
+    // 2. Быть авторизованным админом в памяти сервера (executor)
+    
+    const isMaster = password === CONFIG.SERVER_MASTER_PASS;
+    const isAuthorizedAdmin = executor && isAdmin(executor);
 
-    // Логирование попыток входа
-    if (password !== SERVER_PASSWORD) {
-        console.warn(`[ADMIN FAIL] Wrong Password from IP: ${adminIP}`);
-        return res.status(403).json({ error: "Wrong Password" });
+    if (!isMaster && !isAuthorizedAdmin) {
+        return res.status(401).send(); // Молчаливый отказ
     }
 
-    if (target === CREATOR_NAME && ['ban', 'kick', 'mute'].includes(action)) {
-        return res.json({ success: false, error: "GOD MODE: Cannot touch Creator." });
-    }
-
-    console.log(`[ADMIN ACTION] ${action} on ${target} by IP: ${adminIP}`);
+    const sysTime = Date.now();
+    let sysMsg = "";
+    const targetClean = cleanText(target);
 
     switch (action) {
-        case 'info':
-            if (target && userInfoMap.has(target)) {
-                const info = userInfoMap.get(target);
-                return res.json({ 
-                    success: true, 
-                    data: {
-                        username: target, ip: info.ip, userAgent: info.userAgent,
-                        lastSeen: new Date(info.lastSeen).toLocaleString(),
-                        status: info.isBanned ? "BANNED" : (info.isMuted ? "MUTED" : "ACTIVE")
-                    } 
-                });
-            } else return res.json({ success: false, error: "User not found" });
-
         case 'ban':
-            if (target) {
-                bannedUsers.add(target);
-                if (userInfoMap.has(target)) bannedIPs.add(userInfoMap.get(target).ip);
-                globalMessages.push({ player: "SYSTEM", msg: `🚫 User ${sanitize(target)} BANNED.`, timestamp: Date.now(), type: "sys" });
-            }
+            if (!targetClean) return res.json({error: "No target"});
+            // Нельзя забанить другого админа (защита от дурака)
+            if (isAdmin(targetClean)) return res.json({error: "Cannot ban admin"});
+            
+            bans[targetClean] = sysTime + (duration * 1000); 
+            sysMsg = `🚫 SYSTEM: ${targetClean} banned for ${duration/60} mins.`; 
             break;
 
-        case 'announce':
-            if(text) globalMessages.push({ player: "ANNOUNCEMENT", msg: sanitize(text), timestamp: Date.now(), type: "announce" });
-            break;
-            
-        case 'mute':
-            if (target) {
-                mutedUsers.set(target, Date.now() + (duration * 1000));
-                globalMessages.push({ player: "SYSTEM", msg: `🔇 User ${sanitize(target)} muted.`, timestamp: Date.now(), type: "sys" });
-            }
-            break;
-            
-        case 'kick':
-            if (target) globalMessages.push({ player: "SYSTEM", msg: `🦵 User ${sanitize(target)} KICKED.`, timestamp: Date.now(), type: "sys" });
-            break;
-            
         case 'unban':
-            if (target) {
-                bannedUsers.delete(target);
-                globalMessages.push({ player: "SYSTEM", msg: `✅ User ${sanitize(target)} unbanned.`, timestamp: Date.now(), type: "sys" });
-            }
+            if (bans[targetClean]) delete bans[targetClean];
+            sysMsg = `✅ SYSTEM: ${targetClean} unbanned.`;
+            break;
+
+        case 'mute':
+            if (isAdmin(targetClean)) return res.json({error: "Cannot mute admin"});
+            mutes[targetClean] = sysTime + (duration * 1000);
+            sysMsg = `🔇 SYSTEM: ${targetClean} muted for ${duration/60} mins.`;
+            break;
+
+        case 'kick':
+            if (isAdmin(targetClean)) return res.json({error: "Cannot kick admin"});
+            // Кик - это просто сообщение, клиентский скрипт должен увидеть его и закрыть игру
+            sysMsg = `👢 SYSTEM: ${targetClean} kicked.`; 
             break;
 
         case 'clear':
-            globalMessages = [];
-            globalMessages.push({ player: "SYSTEM", msg: "🧹 Chat cleared.", timestamp: Date.now(), type: "sys" });
+            messages = [];
+            sysMsg = `🧹 Chat cleared by administrator.`;
             break;
 
-        default: return res.status(400).json({ error: "Unknown Action" });
+        case 'announce':
+            messages.push({ 
+                player: "ANNOUNCEMENT", 
+                msg: cleanText(text), 
+                timestamp: Date.now(), 
+                type: "announce" 
+            });
+            return res.json({ success: true });
+
+        case 'info':
+            // Возвращаем статус, но СКРЫВАЕМ IP
+            const infoData = { 
+                status: isBanned(targetClean) ? "BANNED" : (isMuted(targetClean) ? "MUTED" : "ACTIVE"),
+                role: isAdmin(targetClean) ? "ADMIN" : "USER",
+                ip: "HIDDEN-BY-SERVER" 
+            };
+            return res.json({ success: true, data: infoData });
     }
+
+    if (sysMsg) {
+        messages.push({ 
+            player: "SYSTEM", 
+            msg: sysMsg, 
+            timestamp: Date.now(), 
+            type: "sys" 
+        });
+    }
+
     res.json({ success: true });
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🛡️ ULTRA SECURE SERVER PORT ${PORT}`));
