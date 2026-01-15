@@ -1,19 +1,15 @@
 {
-  "name": "chat-server-secure",
-  "version": "2.0.0",
-  "description": "Hardened Roblox Chat Server",
+  "name": "chat",
+  "version": "1.0.0",
+  "description": "chat",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
+    "body-parser": "^1.20.2",
     "cors": "^2.8.5",
-    "express-rate-limit": "^7.1.5",
-    "helmet": "^7.1.0",
-    "hpp": "^0.2.3"
-  },
-  "engines": {
-    "node": ">=16.0.0"
+    "sanitize-html": "^2.11.0"
   }
 }
