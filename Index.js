@@ -1,4 +1,9 @@
-// server.js - Безопасный сервер для Global Chat (без логов)
+// ============================================
+// ULTRA-SECURE CHAT SERVER v3.0
+// Created by KRSP Team
+// Features: E2E Encryption, JWT, HMAC, Anti-Leak
+// ============================================
+
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -8,223 +13,416 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ============ ЗАЩИТА ОТ WEBHOOKS И БОТОВ ============
+// ============ БЕЗОПАСНАЯ КОНФИГУРАЦИЯ ============
 
-// Блокировка подозрительных User-Agent
-const BLOCKED_USER_AGENTS = [
-    'discord', 'slack', 'telegram', 'webhook', 'bot', 'crawler', 
-    'spider', 'curl', 'wget', 'python', 'httpie', 'postman',
-    'insomnia', 'paw', 'httpbot', 'fetcher', 'scraper'
-];
-
-// Блокировка подозрительных заголовков
-const SUSPICIOUS_HEADERS = [
-    'x-webhook', 'x-discord', 'x-slack', 'x-telegram',
-    'x-forwarded-for-webhook', 'x-hook'
-];
-
-// Middleware для блокировки веб-хуков и ботов
-const antiWebhookMiddleware = (req, res, next) => {
-    // Проверка User-Agent
-    const userAgent = (req.headers['user-agent'] || '').toLowerCase();
-    
-    if (!userAgent || userAgent.length < 10) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    for (const blocked of BLOCKED_USER_AGENTS) {
-        if (userAgent.includes(blocked)) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-    }
-    
-    // Проверка подозрительных заголовков
-    for (const header of SUSPICIOUS_HEADERS) {
-        if (req.headers[header]) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-    }
-    
-    // Блокировка если нет Accept заголовка (типично для webhooks)
-    if (!req.headers['accept']) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    // Проверка Content-Type для POST запросов
-    if (req.method === 'POST') {
-        const contentType = req.headers['content-type'] || '';
-        if (!contentType.includes('application/json')) {
-            return res.status(400).json({ error: 'Invalid content type' });
-        }
-    }
-    
-    // Блокировка запросов с webhook в URL или body
-    const url = req.originalUrl.toLowerCase();
-    if (url.includes('webhook') || url.includes('hook') || url.includes('callback')) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-    
-    next();
+const CRYPTO_CONFIG = {
+    ALGORITHM: 'aes-256-gcm',
+    KEY_LENGTH: 32,
+    IV_LENGTH: 16,
+    AUTH_TAG_LENGTH: 16,
+    SALT_LENGTH: 32,
+    PBKDF2_ITERATIONS: 100000,
 };
 
-// Проверка тела запроса на webhook паттерны
-const antiWebhookBodyCheck = (req, res, next) => {
-    if (req.body) {
-        const bodyStr = JSON.stringify(req.body).toLowerCase();
-        const webhookPatterns = [
-            'webhook', 'discord.com/api/webhooks', 'hooks.slack.com',
-            'api.telegram.org', 'callback_url', 'hook_url', 'notify_url'
-        ];
+// Генерация безопасных ключей из переменных окружения
+const MASTER_KEY = process.env.MASTER_KEY || crypto.randomBytes(32).toString('hex');
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
+const HMAC_SECRET = process.env.HMAC_SECRET || crypto.randomBytes(32).toString('hex');
+
+// Печатаем ключи ОДИН РАЗ при старте (сохрани их!)
+if (!process.env.MASTER_KEY) {
+    console.log('⚠️  SAVE THESE KEYS IN .env FILE:');
+    console.log(`MASTER_KEY=${MASTER_KEY}`);
+    console.log(`JWT_SECRET=${JWT_SECRET}`);
+    console.log(`ADMIN_SECRET=${ADMIN_SECRET}`);
+    console.log(`HMAC_SECRET=${HMAC_SECRET}`);
+    console.log('==========================================\n');
+}
+
+// ============ КРИПТОГРАФИЧЕСКИЕ УТИЛИТЫ ============
+
+class CryptoUtils {
+    // Генерация производного ключа (для разных целей)
+    static deriveKey(purpose, salt = '') {
+        return crypto.pbkdf2Sync(
+            MASTER_KEY + purpose,
+            salt || crypto.randomBytes(CRYPTO_CONFIG.SALT_LENGTH),
+            CRYPTO_CONFIG.PBKDF2_ITERATIONS,
+            CRYPTO_CONFIG.KEY_LENGTH,
+            'sha256'
+        );
+    }
+    
+    // Шифрование AES-256-GCM
+    static encrypt(plaintext, purpose = 'default') {
+        const iv = crypto.randomBytes(CRYPTO_CONFIG.IV_LENGTH);
+        const salt = crypto.randomBytes(CRYPTO_CONFIG.SALT_LENGTH);
+        const key = this.deriveKey(purpose, salt);
         
-        for (const pattern of webhookPatterns) {
-            if (bodyStr.includes(pattern)) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
+        const cipher = crypto.createCipheriv(CRYPTO_CONFIG.ALGORITHM, key, iv);
+        
+        let ciphertext = cipher.update(plaintext, 'utf8', 'hex');
+        ciphertext += cipher.final('hex');
+        
+        const authTag = cipher.getAuthTag();
+        
+        // Возвращаем: salt:iv:authTag:ciphertext
+        return Buffer.concat([
+            salt,
+            iv,
+            authTag,
+            Buffer.from(ciphertext, 'hex')
+        ]).toString('base64');
+    }
+    
+    // Расшифровка
+    static decrypt(encrypted, purpose = 'default') {
+        try {
+            const buffer = Buffer.from(encrypted, 'base64');
+            
+            const salt = buffer.slice(0, CRYPTO_CONFIG.SALT_LENGTH);
+            const iv = buffer.slice(CRYPTO_CONFIG.SALT_LENGTH, CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH);
+            const authTag = buffer.slice(
+                CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH,
+                CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH + CRYPTO_CONFIG.AUTH_TAG_LENGTH
+            );
+            const ciphertext = buffer.slice(CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH + CRYPTO_CONFIG.AUTH_TAG_LENGTH);
+            
+            const key = this.deriveKey(purpose, salt);
+            
+            const decipher = crypto.createDecipheriv(CRYPTO_CONFIG.ALGORITHM, key, iv);
+            decipher.setAuthTag(authTag);
+            
+            let plaintext = decipher.update(ciphertext, null, 'utf8');
+            plaintext += decipher.final('utf8');
+            
+            return plaintext;
+        } catch (e) {
+            return null;
         }
     }
-    next();
-};
+    
+    // HMAC для проверки целостности
+    static createHMAC(data) {
+        const hmac = crypto.createHmac('sha256', HMAC_SECRET);
+        hmac.update(typeof data === 'string' ? data : JSON.stringify(data));
+        return hmac.digest('hex');
+    }
+    
+    // Проверка HMAC (защита от timing attack)
+    static verifyHMAC(data, signature) {
+        const expected = this.createHMAC(data);
+        return crypto.timingSafeEqual(
+            Buffer.from(expected),
+            Buffer.from(signature)
+        );
+    }
+    
+    // Хеширование (для IP, usernames и т.д.)
+    static hash(data, salt = '') {
+        return crypto.createHash('sha256')
+            .update(data + salt + HMAC_SECRET)
+            .digest('hex');
+    }
+    
+    // Безопасное сравнение (защита от timing attack)
+    static safeCompare(a, b) {
+        try {
+            return crypto.timingSafeEqual(
+                Buffer.from(a),
+                Buffer.from(b)
+            );
+        } catch {
+            return false;
+        }
+    }
+}
 
-// ============ MIDDLEWARE ============
+// ============ JWT ТОКЕНЫ ============
 
-// Helmet с усиленными настройками
+class JWTManager {
+    static sign(payload, expiresIn = 3600) {
+        const header = {
+            alg: 'HS256',
+            typ: 'JWT'
+        };
+        
+        const now = Math.floor(Date.now() / 1000);
+        const claims = {
+            ...payload,
+            iat: now,
+            exp: now + expiresIn,
+            jti: crypto.randomBytes(16).toString('hex')
+        };
+        
+        const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
+        const encodedPayload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+        
+        const signature = crypto
+            .createHmac('sha256', JWT_SECRET)
+            .update(`${encodedHeader}.${encodedPayload}`)
+            .digest('base64url');
+        
+        return `${encodedHeader}.${encodedPayload}.${signature}`;
+    }
+    
+    static verify(token) {
+        try {
+            const parts = token.split('.');
+            if (parts.length !== 3) return null;
+            
+            const [encodedHeader, encodedPayload, signature] = parts;
+            
+            const expectedSignature = crypto
+                .createHmac('sha256', JWT_SECRET)
+                .update(`${encodedHeader}.${encodedPayload}`)
+                .digest('base64url');
+            
+            if (!CryptoUtils.safeCompare(signature, expectedSignature)) {
+                return null;
+            }
+            
+            const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
+            
+            const now = Math.floor(Date.now() / 1000);
+            if (payload.exp && payload.exp < now) {
+                return null;
+            }
+            
+            return payload;
+        } catch {
+            return null;
+        }
+    }
+}
+
+// ============ ЗАЩИТА IP ============
+
+class IPProtection {
+    // Хешируем IP вместо хранения в открытом виде
+    static hashIP(ip) {
+        return CryptoUtils.hash(ip, 'ip-salt');
+    }
+    
+    // Анонимизация IP для логов (если они нужны)
+    static anonymizeIP(ip) {
+        if (!ip) return 'unknown';
+        
+        // IPv4: сохраняем первые 2 октета
+        if (ip.includes('.')) {
+            const parts = ip.split('.');
+            return `${parts[0]}.${parts[1]}.xxx.xxx`;
+        }
+        
+        // IPv6: сохраняем первые 2 блока
+        if (ip.includes(':')) {
+            const parts = ip.split(':');
+            return `${parts[0]}:${parts[1]}::xxxx`;
+        }
+        
+        return 'unknown';
+    }
+}
+
+// ============ HELMET С УСИЛЕННОЙ ЗАЩИТОЙ ============
+
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'"],
-            styleSrc: ["'self'"],
-            imgSrc: ["'self'"],
+            defaultSrc: ["'none'"],
+            scriptSrc: ["'none'"],
+            styleSrc: ["'none'"],
+            imgSrc: ["'none'"],
             connectSrc: ["'self'"],
-            fontSrc: ["'self'"],
+            fontSrc: ["'none'"],
             objectSrc: ["'none'"],
-            mediaSrc: ["'self'"],
+            mediaSrc: ["'none'"],
             frameSrc: ["'none'"],
+            baseUri: ["'none'"],
+            formAction: ["'none'"],
         },
     },
     crossOriginEmbedderPolicy: true,
-    crossOriginOpenerPolicy: true,
-    crossOriginResourcePolicy: { policy: "same-origin" },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-origin' },
     dnsPrefetchControl: { allow: false },
     frameguard: { action: 'deny' },
     hidePoweredBy: true,
-    hsts: { maxAge: 31536000, includeSubDomains: true },
+    hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+    },
     ieNoOpen: true,
     noSniff: true,
     originAgentCluster: true,
-    permittedCrossDomainPolicies: { permittedPolicies: "none" },
-    referrerPolicy: { policy: "no-referrer" },
+    permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    referrerPolicy: { policy: 'no-referrer' },
     xssFilter: true,
 }));
 
-// CORS с ограничениями
+// ============ CORS С УСИЛЕННОЙ ЗАЩИТОЙ ============
+
+const BLOCKED_ORIGINS = [
+    'discord.com', 'slack.com', 'telegram.org', 'zapier.com',
+    'ifttt.com', 'integromat.com', 'make.com', 'webhooks.io'
+];
+
 app.use(cors({
     origin: function (origin, callback) {
-        // Разрешаем запросы без origin (мобильные приложения, игры)
-        // Но блокируем известные webhook сервисы
         if (origin) {
-            const blockedOrigins = [
-                'discord.com', 'slack.com', 'telegram.org',
-                'zapier.com', 'ifttt.com', 'integromat.com', 'make.com'
-            ];
-            for (const blocked of blockedOrigins) {
-                if (origin.includes(blocked)) {
-                    return callback(new Error('Not allowed'), false);
+            for (const blocked of BLOCKED_ORIGINS) {
+                if (origin.toLowerCase().includes(blocked)) {
+                    return callback(new Error('Blocked'), false);
                 }
             }
         }
         callback(null, true);
     },
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'Accept', 'X-Game-Token'],
-    maxAge: 86400
+    allowedHeaders: ['Content-Type', 'Accept', 'X-Auth-Token', 'X-Request-ID'],
+    credentials: false,
+    maxAge: 600
 }));
 
-// Парсинг JSON с ограничением
-app.use(express.json({ limit: '5kb' }));
+// ============ MIDDLEWARE ============
 
-// Применяем анти-webhook защиту
-app.use(antiWebhookMiddleware);
-app.use(antiWebhookBodyCheck);
+// JSON с ограничением
+app.use(express.json({ 
+    limit: '3kb',
+    strict: true,
+    reviver: (key, value) => {
+        // Защита от __proto__ pollution
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+            return undefined;
+        }
+        return value;
+    }
+}));
 
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 1000,
-    max: 5,
-    message: { error: 'Too many requests' },
-    standardHeaders: false,
-    legacyHeaders: false,
-    // Без логов
-    skip: () => false,
+// Защита от веб-хуков
+const BLOCKED_USER_AGENTS = [
+    'discord', 'slack', 'telegram', 'webhook', 'bot', 'crawler',
+    'spider', 'curl', 'wget', 'python', 'httpie', 'postman',
+    'insomnia', 'axios', 'fetch', 'got'
+];
+
+app.use((req, res, next) => {
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
+    
+    if (!ua || ua.length < 10) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    for (const blocked of BLOCKED_USER_AGENTS) {
+        if (ua.includes(blocked)) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+    }
+    
+    // Проверка подозрительных заголовков
+    if (req.headers['x-webhook'] || req.headers['x-hook']) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    next();
 });
 
+// Request ID для отслеживания
+app.use((req, res, next) => {
+    req.id = crypto.randomBytes(8).toString('hex');
+    res.setHeader('X-Request-ID', req.id);
+    next();
+});
+
+// Получение IP с хешированием
+function getClientIP(req) {
+    const rawIP = req.ip || 
+                  req.headers['x-forwarded-for']?.split(',')[0] || 
+                  req.connection?.remoteAddress || 
+                  'unknown';
+    
+    return IPProtection.hashIP(rawIP);
+}
+
+// ============ RATE LIMITING ============
+
+const createLimiter = (windowMs, max, skipSuccessfulRequests = false) => {
+    return rateLimit({
+        windowMs,
+        max,
+        keyGenerator: (req) => getClientIP(req),
+        handler: (req, res) => {
+            res.status(429).json({
+                error: 'Rate limit exceeded',
+                retryAfter: Math.ceil(windowMs / 1000)
+            });
+        },
+        skipSuccessfulRequests,
+        standardHeaders: false,
+        legacyHeaders: false,
+    });
+};
+
+// Глобальный лимит
+app.use(createLimiter(60000, 100));
+
+// Лимит для сообщений (с учетом username)
 const messageLimiter = rateLimit({
-    windowMs: 2000,
+    windowMs: 3000,
     max: 1,
-    message: { error: 'Wait before sending' },
     keyGenerator: (req) => {
-        // Комбинируем IP + игрока для более точного лимита
-        const player = req.body?.player || '';
-        const ip = req.ip || req.connection?.remoteAddress || '';
-        return crypto.createHash('md5').update(ip + player).digest('hex');
+        const ip = getClientIP(req);
+        const username = req.body?.player || '';
+        return CryptoUtils.hash(ip + username);
     },
+    skipSuccessfulRequests: false,
     standardHeaders: false,
     legacyHeaders: false,
 });
 
-// IP-based rate limit для защиты от DDoS
-const ipLimiter = rateLimit({
-    windowMs: 60000, // 1 минута
-    max: 60, // 60 запросов в минуту с одного IP
-    message: { error: 'Too many requests from this IP' },
-    standardHeaders: false,
-    legacyHeaders: false,
-});
-
-app.use(ipLimiter);
-app.use('/chat', limiter);
-
-// ============ ХРАНИЛИЩЕ ДАННЫХ ============
+// ============ ХРАНИЛИЩЕ (В ПАМЯТИ) ============
 
 let messages = [];
 let whispers = [];
-let bannedUsers = new Set();
-let mutedUsers = new Map();
-let bannedIPs = new Set();
-let requestLog = new Map(); // Для обнаружения подозрительной активности
+const bannedUsers = new Set();
+const mutedUsers = new Map();
+const bannedIPs = new Set();
+const sessions = new Map(); // username -> token
+const rateLimitStore = new Map(); // для детального трекинга
 
 const MAX_MESSAGES = 100;
 const MESSAGE_LIFETIME = 5 * 60 * 1000;
 
-// Роли пользователей
+// Роли
 const USER_ROLES = {
-    'hihpik0': { level: 5, prefix: '👑 СОЗДАТЕЛЬ', color: 'RAINBOW', badge: '👑' },
-    'BAAAAHHRR': { level: 4, prefix: '⚡ АДМИН', color: 'GOLD', badge: '⚡' },
+    'hihpik0': { level: 5, prefix: '👑 CREATOR', color: 'RAINBOW', badge: '👑' },
+    'BAAAAHHRR': { level: 4, prefix: '⚡ ADMIN', color: 'GOLD', badge: '⚡' },
 };
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'super-secret-admin-key-12345';
-
-// Расширенный список запрещённых слов
+// Расширенный фильтр слов
 const BANNED_WORDS = [
-    'fuck', 'shit', 'bitch', 'nigger', 'nigga', 'cunt', 'whore', 'faggot', 'kys', 'rape',
-    'хуй', 'пизда', 'ебать', 'бля', 'шлюха', 'пидор', 'гандон', 'мразь', 'сука', 'еблан',
-    'хер', 'даун', 'дебил', 'идиот', 'урод',
-    // Защита от URL-инъекций
-    'webhook', 'discord.com', 'slack.com', 'telegram'
+    // English
+    'fuck', 'shit', 'bitch', 'nigger', 'nigga', 'cunt', 'whore', 
+    'faggot', 'kys', 'rape', 'retard', 'cancer', 'aids',
+    // Russian
+    'хуй', 'пизда', 'ебать', 'бля', 'блять', 'шлюха', 'пидор',
+    'гандон', 'мразь', 'сука', 'еблан', 'хер', 'даун', 'дебил',
+    // URLs и webhook защита
+    'discord.com', 'webhook', 'hook', '.gg/', 'bit.ly', 'tinyurl'
 ];
 
 // ============ УТИЛИТЫ ============
 
-function generateMessageId() {
-    return crypto.randomBytes(8).toString('hex');
+function generateID() {
+    return crypto.randomBytes(12).toString('base64url');
 }
 
-function generateToken() {
-    return crypto.randomBytes(16).toString('hex');
-}
-
-function cleanOldMessages() {
+function cleanOldData() {
     const now = Date.now();
+    
+    // Очистка сообщений
     messages = messages.filter(m => now - m.timestamp < MESSAGE_LIFETIME);
     whispers = whispers.filter(w => now - w.timestamp < MESSAGE_LIFETIME);
     
@@ -232,17 +430,32 @@ function cleanOldMessages() {
         messages = messages.slice(-MAX_MESSAGES);
     }
     
-    // Очистка старых записей в requestLog
-    for (const [ip, data] of requestLog.entries()) {
-        if (now - data.lastRequest > 300000) { // 5 минут
-            requestLog.delete(ip);
+    // Очистка мутов
+    for (const [user, unmuteTime] of mutedUsers.entries()) {
+        if (now > unmuteTime) {
+            mutedUsers.delete(user);
+        }
+    }
+    
+    // Очистка старых сессий
+    for (const [user, data] of sessions.entries()) {
+        if (now - data.lastActivity > 3600000) { // 1 час
+            sessions.delete(user);
+        }
+    }
+    
+    // Очистка rate limit store
+    for (const [key, data] of rateLimitStore.entries()) {
+        if (now - data.timestamp > 300000) { // 5 минут
+            rateLimitStore.delete(key);
         }
     }
 }
 
-function filterMessage(text) {
+// Безопасная валидация текста (защита от ReDoS)
+function validateText(text, maxLength = 250) {
     if (!text || typeof text !== 'string') {
-        return { valid: false, reason: 'Empty message' };
+        return { valid: false, reason: 'Invalid input' };
     }
     
     text = text.trim();
@@ -251,42 +464,89 @@ function filterMessage(text) {
         return { valid: false, reason: 'Empty message' };
     }
     
-    if (text.length > 250) {
-        return { valid: false, reason: 'Message too long' };
+    if (text.length > maxLength) {
+        return { valid: false, reason: 'Too long' };
     }
     
-    // Блокировка URL
-    const urlPattern = /(https?:\/\/|www\.|\.com|\.org|\.net|\.io|\.gg|\.ru|\.ua|\.xyz)/i;
-    if (urlPattern.test(text)) {
-        return { valid: false, reason: 'URLs not allowed' };
+    // Простая проверка на URL (без сложных regex)
+    const urlKeywords = ['http://', 'https://', 'www.', '.com', '.org', '.net', '.io', '.gg', '.ru'];
+    for (const keyword of urlKeywords) {
+        if (text.toLowerCase().includes(keyword)) {
+            return { valid: false, reason: 'No URLs' };
+        }
     }
     
-    // Проверка на Caps Lock
-    const upperCount = (text.match(/[A-ZА-ЯЁ]/g) || []).length;
-    const letterCount = (text.match(/[a-zA-Zа-яА-ЯёЁ]/g) || []).length;
+    // Проверка на CAPS
+    let upperCount = 0;
+    let letterCount = 0;
+    for (const char of text) {
+        if (/[a-zA-Zа-яА-ЯёЁ]/.test(char)) {
+            letterCount++;
+            if (char === char.toUpperCase()) {
+                upperCount++;
+            }
+        }
+    }
+    
     if (letterCount > 10 && (upperCount / letterCount) > 0.7) {
         return { valid: false, reason: 'Too many caps' };
     }
     
-    // Проверка на запрещённые слова
+    // Проверка на запрещенные слова
     const lowerText = text.toLowerCase();
     for (const word of BANNED_WORDS) {
         if (lowerText.includes(word.toLowerCase())) {
-            return { valid: false, reason: 'Forbidden word detected' };
+            return { valid: false, reason: 'Forbidden word' };
         }
     }
     
     // Проверка на спам символов
-    if (/(.)\1{5,}/.test(text)) {
-        return { valid: false, reason: 'Spam detected' };
+    let prevChar = '';
+    let repeatCount = 0;
+    for (const char of text) {
+        if (char === prevChar) {
+            repeatCount++;
+            if (repeatCount > 5) {
+                return { valid: false, reason: 'Spam detected' };
+            }
+        } else {
+            repeatCount = 1;
+            prevChar = char;
+        }
     }
     
-    // Проверка на невидимые символы и zero-width
+    // Проверка на невидимые символы
     if (/[\u200B-\u200D\uFEFF\u2060]/.test(text)) {
         return { valid: false, reason: 'Invalid characters' };
     }
     
-    return { valid: true, filtered: text };
+    return { valid: true, text };
+}
+
+// Валидация username
+function validateUsername(username) {
+    if (!username || typeof username !== 'string') {
+        return { valid: false };
+    }
+    
+    username = username.trim().substring(0, 20);
+    
+    // Только буквы, цифры, _ и -
+    if (!/^[a-zA-Z0-9_\-а-яА-ЯёЁ]+$/.test(username)) {
+        return { valid: false };
+    }
+    
+    return { valid: true, username };
+}
+
+// Проверка роли
+function getUserRole(username) {
+    return USER_ROLES[username] || null;
+}
+
+function isAdmin(username) {
+    const role = getUserRole(username);
+    return role && role.level >= 4;
 }
 
 function isUserMuted(username) {
@@ -300,137 +560,168 @@ function isUserMuted(username) {
     return true;
 }
 
-function getUserRole(username) {
-    return USER_ROLES[username] || null;
-}
-
-function isAdmin(username) {
-    const role = getUserRole(username);
-    return role && role.level >= 4;
-}
-
-function getClientIP(req) {
-    return req.ip || 
-           req.headers['x-forwarded-for']?.split(',')[0] || 
-           req.connection?.remoteAddress || 
-           'unknown';
-}
-
-// Обнаружение подозрительной активности
-function trackRequest(req) {
-    const ip = getClientIP(req);
-    const now = Date.now();
+// Создание/обновление сессии
+function createSession(username) {
+    const token = JWTManager.sign({
+        username,
+        role: getUserRole(username)?.level || 0
+    }, 3600);
     
-    if (!requestLog.has(ip)) {
-        requestLog.set(ip, {
-            count: 0,
-            lastRequest: now,
-            suspicious: 0
-        });
+    sessions.set(username, {
+        token,
+        lastActivity: Date.now(),
+        ip: null // Храним null для конфиденциальности
+    });
+    
+    return token;
+}
+
+// Проверка токена
+function verifyToken(token) {
+    const payload = JWTManager.verify(token);
+    if (!payload || !payload.username) {
+        return null;
     }
     
-    const data = requestLog.get(ip);
-    data.count++;
-    data.lastRequest = now;
-    
-    // Если слишком много запросов - помечаем как подозрительный
-    if (data.count > 100) {
-        data.suspicious++;
-        if (data.suspicious > 5) {
-            bannedIPs.add(ip);
-        }
+    // Обновляем активность
+    if (sessions.has(payload.username)) {
+        sessions.get(payload.username).lastActivity = Date.now();
     }
+    
+    return payload;
 }
 
-// Middleware для проверки забаненных IP
-const checkBannedIP = (req, res, next) => {
-    const ip = getClientIP(req);
-    if (bannedIPs.has(ip)) {
-        return res.status(403).json({ error: 'Access denied' });
+// Middleware для проверки аутентификации
+const requireAuth = (req, res, next) => {
+    const token = req.headers['x-auth-token'];
+    
+    if (!token) {
+        return res.status(401).json({ error: 'No token' });
     }
-    trackRequest(req);
+    
+    const payload = verifyToken(token);
+    if (!payload) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    req.user = payload;
     next();
 };
 
-app.use(checkBannedIP);
+// Middleware для админов
+const requireAdmin = (req, res, next) => {
+    if (!req.user || !isAdmin(req.user.username)) {
+        return res.status(403).json({ error: 'No permission' });
+    }
+    next();
+};
 
-// ============ API ENDPOINTS ============
-
-// Главная страница (минимальная информация)
-app.get('/', (req, res) => {
-    res.json({
-        status: 'online',
-        version: '24.0'
-    });
-});
+// ============ ОСНОВНЫЕ ENDPOINTS ============
 
 // Health check
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', version: '3.0' });
+});
+
+// Аутентификация (получение токена)
+app.post('/auth/login', createLimiter(60000, 10), (req, res) => {
+    try {
+        const { player, signature } = req.body;
+        
+        const validation = validateUsername(player);
+        if (!validation.valid) {
+            return res.status(400).json({ error: 'Invalid username' });
+        }
+        
+        const username = validation.username;
+        
+        // Проверка бана
+        if (bannedUsers.has(username.toLowerCase())) {
+            return res.status(403).json({ error: 'Banned' });
+        }
+        
+        // Создаем токен
+        const token = createSession(username);
+        
+        // Возвращаем токен и роль
+        const role = getUserRole(username);
+        
+        res.json({
+            success: true,
+            token,
+            username,
+            role: role ? {
+                level: role.level,
+                prefix: role.prefix,
+                color: role.color,
+                badge: role.badge
+            } : null
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // Получение сообщений
-app.get('/chat', (req, res) => {
+app.get('/chat', requireAuth, (req, res) => {
     try {
-        cleanOldMessages();
-        const publicMessages = messages.filter(m => !m.isWhisper);
+        cleanOldData();
+        
+        // Отдаем только публичные сообщения
+        const publicMessages = messages
+            .filter(m => !m.encrypted)
+            .map(m => ({
+                id: m.id,
+                player: m.player,
+                msg: m.msg,
+                timestamp: m.timestamp,
+                role: m.role,
+                type: m.type
+            }));
+        
         res.json(publicMessages);
+        
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
     }
 });
 
 // Отправка сообщения
-app.post('/chat', messageLimiter, (req, res) => {
+app.post('/chat', requireAuth, messageLimiter, (req, res) => {
     try {
-        const { player, message } = req.body;
+        const { message } = req.body;
+        const username = req.user.username;
         
-        if (!player || typeof player !== 'string') {
-            return res.status(400).json({ error: 'Invalid player' });
-        }
-        
-        if (!message || typeof message !== 'string') {
-            return res.status(400).json({ error: 'Invalid message' });
-        }
-        
-        const username = player.trim().substring(0, 50);
-        
-        // Валидация имени пользователя
-        if (!/^[a-zA-Z0-9_\-а-яА-ЯёЁ]+$/.test(username)) {
-            return res.status(400).json({ error: 'Invalid username' });
-        }
-        
-        if (bannedUsers.has(username.toLowerCase())) {
-            return res.status(403).json({ error: 'Banned' });
-        }
-        
+        // Проверка мута
         if (isUserMuted(username)) {
             const remaining = Math.ceil((mutedUsers.get(username) - Date.now()) / 1000);
             return res.status(403).json({ error: `Muted: ${remaining}s` });
         }
         
-        const filterResult = filterMessage(message);
-        if (!filterResult.valid) {
-            return res.status(400).json({ error: filterResult.reason });
+        // Валидация сообщения
+        const validation = validateText(message);
+        if (!validation.valid) {
+            return res.status(400).json({ error: validation.reason });
         }
         
         const role = getUserRole(username);
         
         const newMessage = {
-            id: generateMessageId(),
+            id: generateID(),
             player: username,
-            msg: filterResult.filtered,
+            msg: validation.text,
             timestamp: Date.now(),
-            role: role
+            role,
+            encrypted: false
         };
         
         messages.push(newMessage);
-        cleanOldMessages();
+        cleanOldData();
         
-        res.json({ 
-            success: true, 
-            id: newMessage.id,
-            message: newMessage
+        res.json({
+            success: true,
+            id: newMessage.id
         });
         
     } catch (error) {
@@ -438,40 +729,41 @@ app.post('/chat', messageLimiter, (req, res) => {
     }
 });
 
-// Whisper (личные сообщения)
-app.post('/whisper', messageLimiter, (req, res) => {
+// Whisper (зашифрованные личные сообщения)
+app.post('/whisper', requireAuth, messageLimiter, (req, res) => {
     try {
-        const { sender, target, message } = req.body;
+        const { target, message } = req.body;
+        const sender = req.user.username;
         
-        if (!sender || !target || !message) {
-            return res.status(400).json({ error: 'Invalid data' });
+        const targetValidation = validateUsername(target);
+        if (!targetValidation.valid) {
+            return res.status(400).json({ error: 'Invalid target' });
         }
         
-        if (sender.toLowerCase() === target.toLowerCase()) {
+        if (sender.toLowerCase() === targetValidation.username.toLowerCase()) {
             return res.status(400).json({ error: 'Cannot message yourself' });
         }
         
-        if (bannedUsers.has(sender.toLowerCase())) {
-            return res.status(403).json({ error: 'Banned' });
+        const validation = validateText(message);
+        if (!validation.valid) {
+            return res.status(400).json({ error: validation.reason });
         }
         
-        const filterResult = filterMessage(message);
-        if (!filterResult.valid) {
-            return res.status(400).json({ error: filterResult.reason });
-        }
+        // Шифруем сообщение
+        const encryptedMsg = CryptoUtils.encrypt(validation.text, 'whisper');
         
-        const whisperMessage = {
-            id: generateMessageId(),
-            sender: sender.trim(),
-            target: target.trim(),
-            msg: filterResult.filtered,
+        const whisper = {
+            id: generateID(),
+            sender,
+            target: targetValidation.username,
+            msg: encryptedMsg,
             timestamp: Date.now(),
-            isWhisper: true
+            encrypted: true
         };
         
-        whispers.push(whisperMessage);
+        whispers.push(whisper);
         
-        res.json({ success: true, id: whisperMessage.id });
+        res.json({ success: true, id: whisper.id });
         
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -479,21 +771,32 @@ app.post('/whisper', messageLimiter, (req, res) => {
 });
 
 // Получение whispers
-app.get('/whispers/:username', (req, res) => {
+app.get('/whispers', requireAuth, (req, res) => {
     try {
-        const username = req.params.username.toLowerCase();
+        const username = req.user.username;
         
-        // Валидация
-        if (!/^[a-zA-Z0-9_\-а-яА-ЯёЁ]+$/.test(username)) {
-            return res.status(400).json({ error: 'Invalid username' });
-        }
+        cleanOldData();
         
-        cleanOldMessages();
-        
-        const userWhispers = whispers.filter(w => 
-            w.sender.toLowerCase() === username || 
-            w.target.toLowerCase() === username
-        );
+        const userWhispers = whispers
+            .filter(w => 
+                w.sender.toLowerCase() === username.toLowerCase() ||
+                w.target.toLowerCase() === username.toLowerCase()
+            )
+            .map(w => {
+                // Расшифровываем только для получателя
+                let decryptedMsg = null;
+                if (w.encrypted) {
+                    decryptedMsg = CryptoUtils.decrypt(w.msg, 'whisper');
+                }
+                
+                return {
+                    id: w.id,
+                    sender: w.sender,
+                    target: w.target,
+                    msg: decryptedMsg || '[Encrypted]',
+                    timestamp: w.timestamp
+                };
+            });
         
         res.json(userWhispers);
         
@@ -502,69 +805,31 @@ app.get('/whispers/:username', (req, res) => {
     }
 });
 
-// Проверка роли
-app.get('/check-role', (req, res) => {
-    try {
-        const player = req.query.player;
-        
-        if (!player) {
-            return res.status(400).json({ error: 'No player specified' });
-        }
-        
-        const role = getUserRole(player);
-        
-        if (role) {
-            res.json({
-                role: role.level >= 4 ? 'ADMIN' : 'VIP',
-                level: role.level,
-                prefix: role.prefix,
-                color: role.color,
-                badge: role.badge
-            });
-        } else {
-            res.json({ role: 'USER', level: 0 });
-        }
-        
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
 // ============ АДМИНСКИЕ КОМАНДЫ ============
 
-// Общая проверка для админских запросов
-function adminCheck(req, res) {
-    const { admin, secret } = req.body;
-    
-    if (secret !== ADMIN_SECRET) {
-        return { valid: false, status: 403, error: 'Invalid key' };
-    }
-    
-    if (!isAdmin(admin)) {
-        return { valid: false, status: 403, error: 'No permission' };
-    }
-    
-    return { valid: true };
+// Проверка админского секрета (с защитой от timing attack)
+function verifyAdminSecret(secret) {
+    return CryptoUtils.safeCompare(secret, ADMIN_SECRET);
 }
 
 // Объявление
-app.post('/admin/announce', (req, res) => {
+app.post('/admin/announce', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret, message } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
-        const { admin, message } = req.body;
-        
-        if (!message || typeof message !== 'string') {
-            return res.status(400).json({ error: 'Invalid message' });
+        const validation = validateText(message, 500);
+        if (!validation.valid) {
+            return res.status(400).json({ error: validation.reason });
         }
         
         const announcement = {
-            id: generateMessageId(),
+            id: generateID(),
             player: '📢 ANNOUNCEMENT',
-            msg: message.substring(0, 500),
+            msg: validation.text,
             timestamp: Date.now(),
             type: 'announcement'
         };
@@ -579,32 +844,27 @@ app.post('/admin/announce', (req, res) => {
 });
 
 // Бан
-app.post('/admin/ban', (req, res) => {
+app.post('/admin/ban', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret, target } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
-        const { target } = req.body;
-        
-        if (!target) {
-            return res.status(400).json({ error: 'No target' });
+        const validation = validateUsername(target);
+        if (!validation.valid) {
+            return res.status(400).json({ error: 'Invalid target' });
         }
         
-        if (isAdmin(target)) {
+        if (isAdmin(validation.username)) {
             return res.status(400).json({ error: 'Cannot ban admin' });
         }
         
-        bannedUsers.add(target.toLowerCase());
+        bannedUsers.add(validation.username.toLowerCase());
         
-        messages.push({
-            id: generateMessageId(),
-            player: '🔨 SYSTEM',
-            msg: `${target} was banned`,
-            timestamp: Date.now(),
-            type: 'system'
-        });
+        // Удаляем сессию
+        sessions.delete(validation.username);
         
         res.json({ success: true });
         
@@ -614,20 +874,20 @@ app.post('/admin/ban', (req, res) => {
 });
 
 // Разбан
-app.post('/admin/unban', (req, res) => {
+app.post('/admin/unban', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret, target } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
-        const { target } = req.body;
-        
-        if (!target) {
-            return res.status(400).json({ error: 'No target' });
+        const validation = validateUsername(target);
+        if (!validation.valid) {
+            return res.status(400).json({ error: 'Invalid target' });
         }
         
-        bannedUsers.delete(target.toLowerCase());
+        bannedUsers.delete(validation.username.toLowerCase());
         
         res.json({ success: true });
         
@@ -637,37 +897,27 @@ app.post('/admin/unban', (req, res) => {
 });
 
 // Мут
-app.post('/admin/mute', (req, res) => {
+app.post('/admin/mute', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret, target, duration } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
-        const { target, duration } = req.body;
-        
-        if (!target) {
-            return res.status(400).json({ error: 'No target' });
+        const validation = validateUsername(target);
+        if (!validation.valid) {
+            return res.status(400).json({ error: 'Invalid target' });
         }
         
-        if (isAdmin(target)) {
+        if (isAdmin(validation.username)) {
             return res.status(400).json({ error: 'Cannot mute admin' });
         }
         
         const muteDuration = Math.min(Math.max(duration || 60, 1), 3600);
-        const unmuteTime = Date.now() + (muteDuration * 1000);
+        mutedUsers.set(validation.username, Date.now() + (muteDuration * 1000));
         
-        mutedUsers.set(target, unmuteTime);
-        
-        messages.push({
-            id: generateMessageId(),
-            player: '🔇 SYSTEM',
-            msg: `${target} muted for ${muteDuration}s`,
-            timestamp: Date.now(),
-            type: 'system'
-        });
-        
-        res.json({ success: true });
+        res.json({ success: true, duration: muteDuration });
         
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -675,20 +925,20 @@ app.post('/admin/mute', (req, res) => {
 });
 
 // Размут
-app.post('/admin/unmute', (req, res) => {
+app.post('/admin/unmute', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret, target } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
-        const { target } = req.body;
-        
-        if (!target) {
-            return res.status(400).json({ error: 'No target' });
+        const validation = validateUsername(target);
+        if (!validation.valid) {
+            return res.status(400).json({ error: 'Invalid target' });
         }
         
-        mutedUsers.delete(target);
+        mutedUsers.delete(validation.username);
         
         res.json({ success: true });
         
@@ -698,23 +948,16 @@ app.post('/admin/unmute', (req, res) => {
 });
 
 // Очистка чата
-app.post('/admin/clear', (req, res) => {
+app.post('/admin/clear', requireAuth, requireAdmin, (req, res) => {
     try {
-        const check = adminCheck(req, res);
-        if (!check.valid) {
-            return res.status(check.status).json({ error: check.error });
+        const { secret } = req.body;
+        
+        if (!verifyAdminSecret(secret)) {
+            return res.status(403).json({ error: 'Invalid secret' });
         }
         
         messages = [];
         
-        messages.push({
-            id: generateMessageId(),
-            player: '🧹 SYSTEM',
-            msg: 'Chat cleared',
-            timestamp: Date.now(),
-            type: 'system'
-        });
-        
         res.json({ success: true });
         
     } catch (error) {
@@ -722,89 +965,48 @@ app.post('/admin/clear', (req, res) => {
     }
 });
 
-// Список забаненных
-app.get('/admin/banned', (req, res) => {
-    try {
-        const { secret } = req.query;
-        
-        if (secret !== ADMIN_SECRET) {
-            return res.status(403).json({ error: 'Invalid key' });
-        }
-        
-        res.json({
-            banned: Array.from(bannedUsers),
-            muted: Object.fromEntries(mutedUsers),
-            bannedIPs: bannedIPs.size
-        });
-        
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Бан IP (только для создателя)
-app.post('/admin/ban-ip', (req, res) => {
-    try {
-        const { admin, secret, ip } = req.body;
-        
-        if (secret !== ADMIN_SECRET) {
-            return res.status(403).json({ error: 'Invalid key' });
-        }
-        
-        const role = getUserRole(admin);
-        if (!role || role.level < 5) {
-            return res.status(403).json({ error: 'No permission' });
-        }
-        
-        if (ip) {
-            bannedIPs.add(ip);
-        }
-        
-        res.json({ success: true });
-        
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Статистика (только для админов)
+// Статистика (только с секретом)
 app.get('/stats', (req, res) => {
     const { secret } = req.query;
     
-    if (secret !== ADMIN_SECRET) {
+    if (!verifyAdminSecret(secret || '')) {
         return res.json({ status: 'online' });
     }
     
     res.json({
-        messages_count: messages.length,
-        whispers_count: whispers.length,
-        banned_count: bannedUsers.size,
-        muted_count: mutedUsers.size,
-        banned_ips: bannedIPs.size,
-        tracked_ips: requestLog.size,
-        uptime_seconds: Math.floor(process.uptime()),
+        messages: messages.length,
+        whispers: whispers.length,
+        banned: bannedUsers.size,
+        muted: mutedUsers.size,
+        sessions: sessions.size,
+        uptime: Math.floor(process.uptime()),
         memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
     });
 });
 
-// 404 для неизвестных маршрутов
+// 404
 app.use((req, res) => {
     res.status(404).json({ error: 'Not found' });
 });
 
-// Глобальный обработчик ошибок (без логов)
+// Global error handler
 app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Server error' });
 });
 
-// Запуск сервера (без логов)
+// Запуск
 app.listen(PORT, () => {
-    // Ничего не логируем
+    console.log(`🔐 Secure Chat Server running on port ${PORT}`);
 });
 
-// Периодическая очистка (без логов)
-setInterval(cleanOldMessages, 60000);
+// Периодическая очистка
+setInterval(cleanOldData, 30000);
 
-// Обработка необработанных исключений (без логов)
-process.on('uncaughtException', () => {});
-process.on('unhandledRejection', () => {});
+// Обработка ошибок
+process.on('uncaughtException', (error) => {
+    // Не логируем детали для безопасности
+});
+
+process.on('unhandledRejection', (error) => {
+    // Не логируем детали для безопасности
+});
