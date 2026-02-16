@@ -2,7 +2,7 @@
   "name": "ultra-secure-chat-server",
   "version": "3.0.0",
   "description": "Ultra-Secure Global Chat Server for Roblox with E2E Encryption",
-  "main": "secure_chat_server.js",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
