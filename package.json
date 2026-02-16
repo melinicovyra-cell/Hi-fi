@@ -4,8 +4,8 @@
   "description": "Ultra-Secure Global Chat Server for Roblox with E2E Encryption",
   "main": "secure_chat_server.js",
   "scripts": {
-    "start": "node secure_chat_server.js",
-    "dev": "nodemon secure_chat_server.js",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "generate-keys": "node -e \"const crypto=require('crypto');console.log('MASTER_KEY='+crypto.randomBytes(32).toString('hex'));console.log('JWT_SECRET='+crypto.randomBytes(64).toString('hex'));console.log('ADMIN_SECRET='+crypto.randomBytes(32).toString('hex'));console.log('HMAC_SECRET='+crypto.randomBytes(32).toString('hex'));\"",
     "test": "echo 'Server ready for testing'"
   },
