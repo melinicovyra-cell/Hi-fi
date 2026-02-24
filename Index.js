@@ -368,13 +368,13 @@ const createLimiter = (windowMs, max, skipSuccessfulRequests = false) => {
 // Глобальный лимит
 app.use(createLimiter(60000, 100));
 
-// Лимит для сообщений (с учетом username)
+// Лимит для сообщений (с учетом username из JWT, не из body)
 const messageLimiter = rateLimit({
     windowMs: 3000,
     max: 1,
     keyGenerator: (req) => {
         const ip = getClientIP(req);
-        const username = req.body?.player || '';
+        const username = req.user?.username || '';
         return CryptoUtils.hash(ip + username);
     },
     skipSuccessfulRequests: false,
@@ -391,6 +391,7 @@ const mutedUsers = new Map();
 const bannedIPs = new Set();
 const sessions = new Map(); // username -> token
 const rateLimitStore = new Map(); // для детального трекинга
+const revokedTokens = new Map(); // jti -> expiry timestamp (список отозванных токенов)
 
 const MAX_MESSAGES = 100;
 const MESSAGE_LIFETIME = 5 * 60 * 1000;
@@ -448,6 +449,13 @@ function cleanOldData() {
     for (const [key, data] of rateLimitStore.entries()) {
         if (now - data.timestamp > 300000) { // 5 минут
             rateLimitStore.delete(key);
+        }
+    }
+
+    // Очистка истёкших отозванных токенов
+    for (const [jti, expiry] of revokedTokens.entries()) {
+        if (now > expiry) {
+            revokedTokens.delete(jti);
         }
     }
 }
@@ -582,12 +590,17 @@ function verifyToken(token) {
     if (!payload || !payload.username) {
         return null;
     }
-    
+
+    // Проверка на отозванный токен (logout)
+    if (payload.jti && revokedTokens.has(payload.jti)) {
+        return null;
+    }
+
     // Обновляем активность
     if (sessions.has(payload.username)) {
         sessions.get(payload.username).lastActivity = Date.now();
     }
-    
+
     return payload;
 }
 
@@ -618,9 +631,9 @@ const requireAdmin = (req, res, next) => {
 
 // ============ ОСНОВНЫЕ ENDPOINTS ============
 
-// Health check
+// Health check (версия не раскрывается для снижения fingerprinting)
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', version: '3.0' });
+    res.json({ status: 'ok' });
 });
 
 // Аутентификация (получение токена)
@@ -663,14 +676,40 @@ app.post('/auth/login', createLimiter(60000, 10), (req, res) => {
     }
 });
 
+// Выход (отзыв токена)
+app.post('/auth/logout', requireAuth, (req, res) => {
+    try {
+        const token = req.headers['x-auth-token'];
+        const payload = JWTManager.verify(token);
+
+        if (payload?.jti) {
+            revokedTokens.set(payload.jti, (payload.exp || 0) * 1000);
+        }
+
+        sessions.delete(req.user.username);
+
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // Получение сообщений
 app.get('/chat', requireAuth, (req, res) => {
     try {
         cleanOldData();
         
-        // Отдаем только публичные сообщения
+        // Отдаем только публичные сообщения с проверкой целостности
         const publicMessages = messages
             .filter(m => !m.encrypted)
+            .filter(m => {
+                // Объявления без HMAC (старые записи) пропускаем только если тип announcement
+                if (!m.hmac) return m.type === 'announcement';
+                const expected = CryptoUtils.createHMAC(
+                    m.id + m.player + m.msg + String(m.timestamp)
+                );
+                return CryptoUtils.safeCompare(expected, m.hmac);
+            })
             .map(m => ({
                 id: m.id,
                 player: m.player,
@@ -706,16 +745,20 @@ app.post('/chat', requireAuth, messageLimiter, (req, res) => {
         }
         
         const role = getUserRole(username);
-        
+
         const newMessage = {
             id: generateID(),
             player: username,
             msg: validation.text,
-            timestamp: Date.now(),
+            timestamp: Math.floor(Date.now() / 5000) * 5000, // округление до 5 сек для приватности
             role,
             encrypted: false
         };
-        
+        // HMAC для защиты целостности хранимых сообщений
+        newMessage.hmac = CryptoUtils.createHMAC(
+            newMessage.id + newMessage.player + newMessage.msg + String(newMessage.timestamp)
+        );
+
         messages.push(newMessage);
         cleanOldData();
         
@@ -778,22 +821,28 @@ app.get('/whispers', requireAuth, (req, res) => {
         cleanOldData();
         
         const userWhispers = whispers
-            .filter(w => 
+            .filter(w =>
                 w.sender.toLowerCase() === username.toLowerCase() ||
                 w.target.toLowerCase() === username.toLowerCase()
             )
             .map(w => {
-                // Расшифровываем только для получателя
-                let decryptedMsg = null;
-                if (w.encrypted) {
-                    decryptedMsg = CryptoUtils.decrypt(w.msg, 'whisper');
+                const isSender = w.sender.toLowerCase() === username.toLowerCase();
+
+                // Расшифровываем только для получателя — отправитель уже знает что отправил
+                let msg;
+                if (!isSender && w.encrypted) {
+                    msg = CryptoUtils.decrypt(w.msg, 'whisper') || '[Encrypted]';
+                } else if (isSender) {
+                    msg = `[Whispered to ${w.target}]`;
+                } else {
+                    msg = '[Encrypted]';
                 }
-                
+
                 return {
                     id: w.id,
                     sender: w.sender,
                     target: w.target,
-                    msg: decryptedMsg || '[Encrypted]',
+                    msg,
                     timestamp: w.timestamp
                 };
             });
@@ -830,10 +879,13 @@ app.post('/admin/announce', requireAuth, requireAdmin, (req, res) => {
             id: generateID(),
             player: '📢 ANNOUNCEMENT',
             msg: validation.text,
-            timestamp: Date.now(),
+            timestamp: Math.floor(Date.now() / 5000) * 5000,
             type: 'announcement'
         };
-        
+        announcement.hmac = CryptoUtils.createHMAC(
+            announcement.id + announcement.player + announcement.msg + String(announcement.timestamp)
+        );
+
         messages.push(announcement);
         
         res.json({ success: true });
@@ -965,11 +1017,11 @@ app.post('/admin/clear', requireAuth, requireAdmin, (req, res) => {
     }
 });
 
-// Статистика (только с секретом)
+// Статистика (только с секретом в заголовке, не в query — иначе попадает в логи)
 app.get('/stats', (req, res) => {
-    const { secret } = req.query;
-    
-    if (!verifyAdminSecret(secret || '')) {
+    const secret = req.headers['x-admin-secret'] || '';
+
+    if (!verifyAdminSecret(secret)) {
         return res.json({ status: 'online' });
     }
     
