@@ -1,7 +1,7 @@
 {
   "name": "ultra-secure-chat-server",
-  "version": "3.0.0",
-  "description": "Ultra-Secure Global Chat Server for Roblox with E2E Encryption",
+  "version": "4.0.0",
+  "description": "Ultra-Secure Chat Server with PostgreSQL persistence (messages, bans, mutes). Ready for Render.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -13,7 +13,8 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "helmet": "^7.1.0",
-    "express-rate-limit": "^7.1.5"
+    "express-rate-limit": "^7.1.5",
+    "pg": "^8.11.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
@@ -22,13 +23,13 @@
     "node": ">=18.0.0"
   },
   "keywords": [
-    "roblox",
     "chat",
     "secure",
     "encryption",
-    "e2e",
+    "postgresql",
     "jwt",
-    "api"
+    "api",
+    "render"
   ],
   "author": "KRSP Team",
   "license": "MIT"
