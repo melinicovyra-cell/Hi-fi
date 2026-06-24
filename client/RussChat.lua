@@ -10,10 +10,9 @@ local CONFIG = {
     USERNAME      = nil,  -- nil = ник Roblox
     -- Ключ доступа к API. ДОЛЖЕН совпадать с CLIENT_KEY на сервере.
     CLIENT_KEY    = "f6ca310defebb2e3e499fd9495fb94a96590c65dd5a5359b",
-    -- В публичной версии секрет владельца ПУСТОЙ — обычные люди не должны иметь bypass.
-    ADMIN_SECRET  = "",
     POLL_INTERVAL = 2,    -- опрос сервера, сек (не меньше 1.2)
 }
+-- В публичной версии нет ни секрета владельца, ни bypass-логики — это обычный чат-клиент.
 
 -- ============ СЕРВИСЫ ============
 local Players      = game:GetService("Players")
@@ -245,13 +244,13 @@ local ok, buildErr = pcall(function()
         tween(sysWrp, 0.8, {GroupTransparency=0}, Enum.EasingStyle.Quint); scrollDown()
     end
 
-    -- ================= 🔐 ЛОГИКА СЕРВЕРА + ЗАЩИТА + BYPASS ВЛАДЕЛЬЦА =================
+    -- ================= 🔐 ЛОГИКА СЕРВЕРА + ЗАЩИТА =================
     local httpRequest = (syn and syn.request) or (http and http.request)
         or http_request or (fluxus and fluxus.request)
         or (getgenv and getgenv().request) or request
     local hasHttp = httpRequest ~= nil
 
-    local token, connected, isOwner, canSend = nil, false, false, true
+    local token, connected, canSend = nil, false, true
     local seenIds, pendingMine = {}, {}
 
     local function apiRequest(method, path, body)
@@ -272,12 +271,9 @@ local ok, buildErr = pcall(function()
     end
 
     local function login()
-        local data, status = apiRequest("POST", "/auth/login", {
-            player = USERNAME, adminSecret = (CONFIG.ADMIN_SECRET ~= "" and CONFIG.ADMIN_SECRET) or nil })
+        local data, status = apiRequest("POST", "/auth/login", { player = USERNAME })
         if status == 200 and data and data.token then
             token = data.token; connected = true
-            -- владелец/админ (level >= 4) → включаем bypass-режим
-            isOwner = (data.role and data.role.level and data.role.level >= 4) and true or false
             return true
         end
         connected = false
@@ -305,13 +301,11 @@ local ok, buildErr = pcall(function()
         end
     end
 
-    -- отправка: защита (длина/кулдаун для обычных) + bypass для владельца
+    -- отправка: защита (длина + кулдаун)
     local function sendMessage(text)
         if not connected then addChat({ player = USERNAME, msg = text }); return end
-        if not isOwner then
-            if not canSend then systemLog("⏳ Подожди пару секунд") return end
-            canSend = false; task.delay(2.5, function() canSend = true end)
-        end
+        if not canSend then systemLog("⏳ Подожди пару секунд") return end
+        canSend = false; task.delay(2.5, function() canSend = true end)
         local data, status = apiRequest("POST", "/chat", { message = text })
         if status == 200 then
             pendingMine[text] = (pendingMine[text] or 0) + 1
@@ -335,8 +329,7 @@ local ok, buildErr = pcall(function()
     local function doSend()
         local txt = box.Text
         if not txt or txt:gsub("%s", "") == "" then return end
-        local maxLen = isOwner and 480 or 250                 -- защита: ограничение длины
-        if #txt > maxLen then txt = txt:sub(1, maxLen) end
+        if #txt > 250 then txt = txt:sub(1, 250) end          -- защита: ограничение длины
         box.Text = "" -- Триггерит реактивный мотор, чтобы он плавно отключился обратно в серый цвет
         task.spawn(sendFlyAnim); task.spawn(sendMessage, txt) -- реальная отправка на сервер
     end
@@ -368,7 +361,7 @@ local ok, buildErr = pcall(function()
         task.spawn(function()
             local okL, err = login()
             if okL then
-                systemLog(isOwner and "👑 Владелец подключён · bypass активен" or "✅ Подключено к серверу")
+                systemLog("✅ Подключено к серверу")
                 while screen.Parent do
                     pcall(fetchMessages)
                     task.wait(math.max(1.2, CONFIG.POLL_INTERVAL))
