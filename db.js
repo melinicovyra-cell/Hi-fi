@@ -84,6 +84,14 @@ function createPostgresBackend(connectionString) {
                     created_at  BIGINT NOT NULL
                 );
             `);
+
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS ip_bans (
+                    ip_hash     TEXT PRIMARY KEY,
+                    username    TEXT,
+                    created_at  BIGINT NOT NULL
+                );
+            `);
         },
 
         // ---- messages ----
@@ -193,6 +201,30 @@ function createPostgresBackend(connectionString) {
             }));
         },
 
+        // ---- ip bans ----
+        async addIpBan(ipHash, username) {
+            await pool.query(
+                `INSERT INTO ip_bans (ip_hash, username, created_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (ip_hash) DO UPDATE SET username = EXCLUDED.username`,
+                [ipHash, username ? username.toLowerCase() : null, Date.now()]
+            );
+        },
+
+        // remove all IP bans tied to a username, return the freed ip hashes
+        async removeIpBansForUser(username) {
+            const { rows } = await pool.query(
+                `DELETE FROM ip_bans WHERE username = $1 RETURNING ip_hash`,
+                [username.toLowerCase()]
+            );
+            return rows.map((r) => r.ip_hash);
+        },
+
+        async listIpBans() {
+            const { rows } = await pool.query(`SELECT ip_hash FROM ip_bans`);
+            return rows.map((r) => r.ip_hash);
+        },
+
         // ---- mutes ----
         async addMute(username, unmuteAt, mutedBy) {
             await pool.query(
@@ -262,6 +294,7 @@ function createMemoryBackend() {
     let whispers = [];
     const bans = new Map(); // username -> {reason, bannedBy, timestamp}
     const mutes = new Map(); // username -> {unmuteAt, mutedBy, timestamp}
+    const ipBans = new Map(); // ip_hash -> username
 
     return {
         kind: 'memory',
@@ -312,6 +345,21 @@ function createMemoryBackend() {
                 bannedBy: v.bannedBy,
                 timestamp: v.timestamp,
             }));
+        },
+
+        async addIpBan(ipHash, username) {
+            ipBans.set(ipHash, username ? username.toLowerCase() : null);
+        },
+        async removeIpBansForUser(username) {
+            const lower = username.toLowerCase();
+            const freed = [];
+            for (const [hash, user] of ipBans.entries()) {
+                if (user === lower) { freed.push(hash); ipBans.delete(hash); }
+            }
+            return freed;
+        },
+        async listIpBans() {
+            return [...ipBans.keys()];
         },
 
         async addMute(username, unmuteAt, mutedBy) {

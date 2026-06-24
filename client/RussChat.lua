@@ -9,8 +9,12 @@
 -- ============ КОНФИГ ============
 local CONFIG = {
     SERVER_URL    = "https://my-secure-chat.onrender.com",
-    USERNAME      = nil,  -- nil = ник Roblox. Bypass-режим включается, если этот ник = владелец на сервере
-    ADMIN_SECRET  = "",   -- больше НЕ нужен для bypass (владелец определяется по нику). Оставь пустым.
+    USERNAME      = nil,  -- nil = ник Roblox
+    -- Ключ доступа к API. ДОЛЖЕН совпадать с CLIENT_KEY на сервере, иначе сервер отклонит запросы.
+    CLIENT_KEY    = "",
+    -- Секрет владельца. Заполни ТОЛЬКО в своей личной копии, чтобы войти как владелец (bypass).
+    -- В публичной копии оставь пустым.
+    ADMIN_SECRET  = "",
     POLL_INTERVAL = 2,    -- опрос сервера, сек (не меньше 1.2)
 }
 
@@ -257,6 +261,7 @@ local ok, buildErr = pcall(function()
         if not hasHttp then return nil, -1 end
         -- защита: «нормальный» User-Agent, чтобы пройти анти-бот фильтр сервера
         local headers = { ["User-Agent"] = "RussChatClient/1.0", ["Accept"] = "application/json" }
+        if CONFIG.CLIENT_KEY ~= "" then headers["X-Client-Key"] = CONFIG.CLIENT_KEY end
         if token then headers["X-Auth-Token"] = token end
         if body then headers["Content-Type"] = "application/json" end
         local okReq, res = pcall(function()

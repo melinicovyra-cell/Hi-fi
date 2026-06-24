@@ -39,6 +39,9 @@ const MASTER_KEY = process.env.MASTER_KEY || crypto.randomBytes(32).toString('he
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
 const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
 const HMAC_SECRET = process.env.HMAC_SECRET || crypto.randomBytes(32).toString('hex');
+// Shared client key: if set, every request must carry the matching X-Client-Key
+// header. Blocks direct API calls from anyone who doesn't have the client.
+const CLIENT_KEY = process.env.CLIENT_KEY || '';
 
 if (!process.env.MASTER_KEY) {
     console.log('⚠️  No persistent secrets found. SAVE THESE in your env (Render dashboard):');
@@ -321,6 +324,32 @@ function getClientIP(req) {
     return IPProtection.hashIP(rawIP);
 }
 
+// ============ API CLIENT KEY ============
+// If CLIENT_KEY is configured, every request (except health) must present it.
+// Stops direct API calls from anyone who doesn't ship the client.
+app.use((req, res, next) => {
+    if (!CLIENT_KEY || req.path === '/health') return next();
+    const provided = req.headers['x-client-key'] || '';
+    if (!CryptoUtils.safeCompare(provided, CLIENT_KEY)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+});
+
+// ============ IP BAN ENFORCEMENT ============
+// In-memory cache of banned IP hashes (loaded from DB at startup). Checked
+// synchronously on every request so banned IPs are blocked everywhere.
+const bannedIpCache = new Set();
+const lastSeenIp = new Map(); // username(lower) -> ip hash (best-effort, in-memory)
+
+app.use((req, res, next) => {
+    if (req.path === '/health') return next();
+    if (bannedIpCache.has(getClientIP(req))) {
+        return res.status(403).json({ error: 'Banned' });
+    }
+    next();
+});
+
 // ============ RATE LIMITING ============
 
 const createLimiter = (windowMs, max) =>
@@ -354,6 +383,20 @@ const messageLimiter = rateLimit({
     skip: (req) => !!(req.user && isAdmin(req.user.username)),
     handler: (req, res) => {
         res.status(429).json({ error: 'Rate limit exceeded', retryAfter: 3 });
+    },
+    standardHeaders: false,
+    legacyHeaders: false,
+});
+
+// Anti-flood: hard cap on messages per IP regardless of username (stops one IP
+// spamming through many different usernames). Privileged users are exempt.
+const chatFloodLimiter = rateLimit({
+    windowMs: 60000,
+    max: 20,
+    keyGenerator: (req) => getClientIP(req),
+    skip: (req) => !!(req.user && isAdmin(req.user.username)),
+    handler: (req, res) => {
+        res.status(429).json({ error: 'Too many messages', retryAfter: 60 });
     },
     standardHeaders: false,
     legacyHeaders: false,
@@ -497,6 +540,8 @@ const requireAuth = (req, res, next) => {
     if (!payload) return res.status(401).json({ error: 'Invalid token' });
 
     req.user = payload;
+    // Remember which IP this user is on, so a ban can also block their IP.
+    lastSeenIp.set(payload.username.toLowerCase(), getClientIP(req));
     next();
 };
 
@@ -526,12 +571,11 @@ app.get('/health', async (req, res) => {
     res.json({ status: 'ok', version: '4.0', storage: db.kind });
 });
 
-// Login by username. The owner is recognised purely by nickname and gets the
-// chat bypass automatically — no secret needed at login.
-// (Destructive admin commands under /admin/* still require ADMIN_SECRET.)
-app.post('/auth/login', createLimiter(60000, 10), async (req, res) => {
+// Login by username. Privileged accounts (owner/admin) MUST present the correct
+// ADMIN_SECRET, otherwise the nickname can be impersonated to gain the bypass.
+app.post('/auth/login', createLimiter(60000, 5), async (req, res) => {
     try {
-        const { player } = req.body;
+        const { player, adminSecret } = req.body;
 
         const validation = validateUsername(player);
         if (!validation.valid) {
@@ -544,6 +588,13 @@ app.post('/auth/login', createLimiter(60000, 10), async (req, res) => {
         }
 
         const role = getUserRole(username);
+
+        // Anti-impersonation: privileged nicknames require the admin secret.
+        if (role && role.level >= ADMIN_LEVEL) {
+            if (!verifyAdminSecret(adminSecret)) {
+                return res.status(403).json({ error: 'Admin verification failed' });
+            }
+        }
 
         const token = createSession(username);
 
@@ -586,7 +637,7 @@ app.get('/chat', requireAuth, async (req, res) => {
 });
 
 // Send a public chat message
-app.post('/chat', requireAuth, requireNotBanned, messageLimiter, async (req, res) => {
+app.post('/chat', requireAuth, requireNotBanned, chatFloodLimiter, messageLimiter, async (req, res) => {
     try {
         const { message } = req.body;
         const username = req.user.username;
@@ -641,7 +692,7 @@ app.post('/chat', requireAuth, requireNotBanned, messageLimiter, async (req, res
 });
 
 // Send an encrypted private whisper
-app.post('/whisper', requireAuth, requireNotBanned, messageLimiter, async (req, res) => {
+app.post('/whisper', requireAuth, requireNotBanned, chatFloodLimiter, messageLimiter, async (req, res) => {
     try {
         const { target, message } = req.body;
         const sender = req.user.username;
@@ -756,6 +807,15 @@ app.post('/admin/ban', requireAuth, requireAdmin, async (req, res) => {
         }
         await db.addBan(validation.username, reason, req.user.username);
         sessions.delete(validation.username);
+
+        // Also ban the IP we last saw this user on, so they can't dodge the
+        // ban by simply changing their claimed nickname.
+        const ipHash = lastSeenIp.get(validation.username.toLowerCase());
+        if (ipHash) {
+            await db.addIpBan(ipHash, validation.username);
+            bannedIpCache.add(ipHash);
+        }
+
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -773,6 +833,9 @@ app.post('/admin/unban', requireAuth, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'Invalid target' });
         }
         await db.removeBan(validation.username);
+        // Lift any IP bans tied to this user.
+        const freed = await db.removeIpBansForUser(validation.username);
+        for (const h of freed) bannedIpCache.delete(h);
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: 'Server error' });
@@ -882,6 +945,10 @@ async function start() {
     try {
         await db.init();
         console.log(`💾 Storage backend: ${db.kind}`);
+        // Warm the IP-ban cache from the database.
+        try {
+            for (const h of await db.listIpBans()) bannedIpCache.add(h);
+        } catch (_) {}
     } catch (e) {
         console.error('❌ Failed to initialize database:', e.message);
         process.exit(1);

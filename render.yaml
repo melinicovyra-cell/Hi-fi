@@ -34,6 +34,10 @@ services:
         generateValue: true
       - key: HMAC_SECRET
         generateValue: true
+      # Shared client key — must be the SAME value in client/RussChat.lua
+      # (CONFIG.CLIENT_KEY). Generated here; copy it into the client.
+      - key: CLIENT_KEY
+        generateValue: true
       - key: NODE_ENV
         value: production
       # Optional retention tuning.
