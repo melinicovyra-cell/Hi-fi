@@ -526,12 +526,12 @@ app.get('/health', async (req, res) => {
     res.json({ status: 'ok', version: '4.0', storage: db.kind });
 });
 
-// Login. Regular users authenticate by username (the game vouches for it).
-// Privileged accounts (admins) MUST present the correct ADMIN_SECRET so they
-// cannot be impersonated.
+// Login by username. The owner is recognised purely by nickname and gets the
+// chat bypass automatically — no secret needed at login.
+// (Destructive admin commands under /admin/* still require ADMIN_SECRET.)
 app.post('/auth/login', createLimiter(60000, 10), async (req, res) => {
     try {
-        const { player, adminSecret } = req.body;
+        const { player } = req.body;
 
         const validation = validateUsername(player);
         if (!validation.valid) {
@@ -544,13 +544,6 @@ app.post('/auth/login', createLimiter(60000, 10), async (req, res) => {
         }
 
         const role = getUserRole(username);
-
-        // Anti-impersonation: privileged usernames require the admin secret.
-        if (role && role.level >= ADMIN_LEVEL) {
-            if (!verifyAdminSecret(adminSecret)) {
-                return res.status(403).json({ error: 'Admin verification failed' });
-            }
-        }
 
         const token = createSession(username);
 

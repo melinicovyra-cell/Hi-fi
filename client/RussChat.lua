@@ -9,8 +9,8 @@
 -- ============ КОНФИГ ============
 local CONFIG = {
     SERVER_URL    = "https://my-secure-chat.onrender.com",
-    USERNAME      = nil,
-    ADMIN_SECRET  = "",   -- секрет владельца: впиши, чтобы войти как владелец и получить bypass
+    USERNAME      = nil,  -- nil = ник Roblox. Bypass-режим включается, если этот ник = владелец на сервере
+    ADMIN_SECRET  = "",   -- больше НЕ нужен для bypass (владелец определяется по нику). Оставь пустым.
     POLL_INTERVAL = 2,    -- опрос сервера, сек (не меньше 1.2)
 }
 
