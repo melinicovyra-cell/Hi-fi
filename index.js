@@ -367,14 +367,13 @@ const sessions = new Map();
 const MAX_SERVED_MESSAGES = 100;
 
 // ============ ROLES ============
-// Owner / admins. level >= ADMIN_LEVEL (4) gets the chat bypass (no cooldown,
-// no mute, no content filter). To log in as one of these the client MUST send
-// the correct ADMIN_SECRET, so it can't be impersonated.
+// Single owner/admin. This account gets the chat bypass (no cooldown, no mute,
+// no content filter). Logging in as the owner REQUIRES the correct ADMIN_SECRET,
+// so it can't be impersonated.
 // 👉 Change the Roblox username key below if the owner's nick is different.
 
 const USER_ROLES = {
-    hihpik0: { level: 5, prefix: '👑 CREATOR', color: 'RAINBOW', badge: '👑' }, // OWNER
-    BAAAAHHRR: { level: 4, prefix: '⚡ ADMIN', color: 'GOLD', badge: '⚡' },
+    hihpik0: { level: 5, prefix: '👑 OWNER', color: 'RAINBOW', badge: '👑' }, // единственный админ — bypass_chat
 };
 
 const ADMIN_LEVEL = 4;
