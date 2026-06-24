@@ -1,18 +1,21 @@
 --[[
-    RUSS CHAT v15 — Haptic Interactive Edition 🕹️  [ПУБЛИЧНАЯ ВЕРСИЯ]
-    Эту версию можно раздавать людям. Обычный чат, без прав владельца.
-    (Админ-версия с bypass — в файле RussChat_Admin.lua, её НЕ раздавай.)
+    RUSS CHAT v15 — Haptic Interactive Edition 🕹️  [АДМИН / ВЛАДЕЛЕЦ]
+    ⚠️ ЭТУ ВЕРСИЮ НИКОМУ НЕ РАЗДАВАЙ. Только для тебя.
+    Даёт bypass (без кулдауна, мута и фильтра), если USERNAME = владелец на сервере
+    и ADMIN_SECRET совпадает с секретом на Render.
 ]]--
 
 -- ============ КОНФИГ ============
 local CONFIG = {
     SERVER_URL    = "https://my-secure-chat.onrender.com",
-    USERNAME      = nil,  -- nil = ник Roblox
+    -- nil = твой ник Roblox. Должен совпадать с ником владельца в USER_ROLES на сервере (hihpik0).
+    USERNAME      = nil,
     -- Ключ доступа к API. ДОЛЖЕН совпадать с CLIENT_KEY на сервере.
     CLIENT_KEY    = "f6ca310defebb2e3e499fd9495fb94a96590c65dd5a5359b",
-    -- В публичной версии секрет владельца ПУСТОЙ — обычные люди не должны иметь bypass.
-    ADMIN_SECRET  = "",
-    POLL_INTERVAL = 2,    -- опрос сервера, сек (не меньше 1.2)
+    -- 👉 ВСТАВЬ СЮДА свой ADMIN_SECRET с Render (вкладка Environment сервиса).
+    --    Без него bypass не включится. Этот файл не публикуй с заполненным секретом!
+    ADMIN_SECRET  = "ВСТАВЬ_СВОЙ_ADMIN_SECRET",
+    POLL_INTERVAL = 2,
 }
 
 -- ============ СЕРВИСЫ ============
