@@ -308,11 +308,11 @@ app.use((req, res, next) => {
 });
 
 function getClientIP(req) {
-    const rawIP =
-        req.ip ||
-        req.headers['x-forwarded-for']?.split(',')[0] ||
-        req.connection?.remoteAddress ||
-        'unknown';
+    // Trust ONLY req.ip (resolved by Express via the configured `trust proxy`).
+    // Never fall back to the raw X-Forwarded-For header — its leftmost value is
+    // attacker-controlled and would let someone spoof their IP to dodge bans /
+    // rate limits.
+    const rawIP = req.ip || req.socket?.remoteAddress || 'unknown';
     return IPProtection.hashIP(rawIP);
 }
 
@@ -501,9 +501,11 @@ function validateUsername(username) {
     return { valid: true, username };
 }
 
-function createSession(username) {
+function createSession(username, ipHash) {
+    // Bind the token to the IP it was issued from. A stolen/leaked token is
+    // then useless from any other IP.
     const token = JWTManager.sign(
-        { username, role: getUserRole(username)?.level || 0 },
+        { username, role: getUserRole(username)?.level || 0, ip: ipHash || null },
         3600
     );
     sessions.set(username, { lastActivity: Date.now() });
@@ -531,6 +533,13 @@ const requireAuth = (req, res, next) => {
 
     const payload = verifyToken(token);
     if (!payload) return res.status(401).json({ error: 'Invalid token' });
+
+    // Token is bound to the IP it was issued from. If the IP changed (or the
+    // token was stolen and replayed elsewhere) → force re-login. The client
+    // already handles 401 by logging in again, so this is seamless.
+    if (payload.ip && payload.ip !== getClientIP(req)) {
+        return res.status(401).json({ error: 'Token IP mismatch' });
+    }
 
     req.user = payload;
     // Remember which IP this user is on, so a ban can also block their IP.
@@ -586,7 +595,7 @@ app.post('/auth/login', createLimiter(60000, 5), async (req, res) => {
             }
         }
 
-        const token = createSession(username);
+        const token = createSession(username, getClientIP(req));
 
         res.json({
             success: true,
@@ -836,7 +845,8 @@ app.post('/admin/unban', requireAuth, requireAdmin, async (req, res) => {
 
 app.get('/admin/bans', requireAuth, requireAdmin, async (req, res) => {
     try {
-        const { secret } = req.query;
+        // Prefer the header (query strings can leak into proxy/access logs).
+        const secret = req.headers['x-admin-secret'] || req.query.secret;
         if (!verifyAdminSecret(secret)) {
             return res.status(403).json({ error: 'Invalid secret' });
         }
@@ -904,7 +914,7 @@ app.post('/admin/clear', requireAuth, requireAdmin, async (req, res) => {
 // Stats (basic when no secret, detailed with the admin secret)
 app.get('/stats', async (req, res) => {
     try {
-        const { secret } = req.query;
+        const secret = req.headers['x-admin-secret'] || req.query.secret;
         if (!verifyAdminSecret(secret)) {
             return res.json({ status: 'online' });
         }
@@ -957,9 +967,23 @@ async function start() {
     server.keepAliveTimeout = 30000;
     server.maxHeadersCount = 50;
 
-    // Periodic cleanup of expired rows.
+    // Periodic cleanup of expired rows + bounding of in-memory maps
+    // (prevents slow memory-exhaustion from many distinct usernames over time).
     setInterval(() => {
         db.cleanupExpired().catch(() => {});
+        const now = Date.now();
+        for (const [user, s] of sessions) {
+            if (now - s.lastActivity > 3600000) sessions.delete(user); // 1h idle
+        }
+        // Hard cap the last-seen-IP map; drop oldest entries beyond the cap.
+        const CAP = 5000;
+        if (lastSeenIp.size > CAP) {
+            let toDrop = lastSeenIp.size - CAP;
+            for (const k of lastSeenIp.keys()) {
+                if (toDrop-- <= 0) break;
+                lastSeenIp.delete(k);
+            }
+        }
     }, 60000);
 }
 
