@@ -55,68 +55,59 @@ if (!process.env.MASTER_KEY) {
 // ============ CRYPTO UTILITIES ============
 
 class CryptoUtils {
-    static deriveKey(purpose, salt) {
-        return crypto.pbkdf2Sync(
-            MASTER_KEY + purpose,
-            salt,
-            CRYPTO_CONFIG.PBKDF2_ITERATIONS,
-            CRYPTO_CONFIG.KEY_LENGTH,
-            'sha256'
-        );
+    static _keyCache = {};
+    static _keySalt = crypto
+        .createHash('sha256')
+        .update('rc-keysalt-v2|' + HMAC_SECRET)
+        .digest();
+
+    // Derive ONE key per purpose, once, and cache it. (Previously every
+    // encrypt/decrypt ran a 100k-iteration PBKDF2 with a per-message salt —
+    // a GET /chat decrypting 100 messages meant 100 PBKDF2 runs on the event
+    // loop, a self-inflicted DoS. Security now comes from a unique random IV
+    // per message under AES-256-GCM, which is the correct design.)
+    static deriveKey(purpose) {
+        if (!CryptoUtils._keyCache[purpose]) {
+            CryptoUtils._keyCache[purpose] = crypto.pbkdf2Sync(
+                MASTER_KEY + ':' + purpose,
+                CryptoUtils._keySalt,
+                CRYPTO_CONFIG.PBKDF2_ITERATIONS,
+                CRYPTO_CONFIG.KEY_LENGTH,
+                'sha256'
+            );
+        }
+        return CryptoUtils._keyCache[purpose];
     }
 
     static encrypt(plaintext, purpose = 'default') {
-        const iv = crypto.randomBytes(CRYPTO_CONFIG.IV_LENGTH);
-        const salt = crypto.randomBytes(CRYPTO_CONFIG.SALT_LENGTH);
-        const key = this.deriveKey(purpose, salt);
-
+        const iv = crypto.randomBytes(12); // 96-bit IV recommended for GCM
+        const key = this.deriveKey(purpose);
         const cipher = crypto.createCipheriv(CRYPTO_CONFIG.ALGORITHM, key, iv);
-        let ciphertext = cipher.update(plaintext, 'utf8', 'hex');
-        ciphertext += cipher.final('hex');
+        const ciphertext = Buffer.concat([
+            cipher.update(plaintext, 'utf8'),
+            cipher.final(),
+        ]);
         const authTag = cipher.getAuthTag();
-
-        return Buffer.concat([
-            salt,
-            iv,
-            authTag,
-            Buffer.from(ciphertext, 'hex'),
-        ]).toString('base64');
+        return Buffer.concat([iv, authTag, ciphertext]).toString('base64');
     }
 
     static decrypt(encrypted, purpose = 'default') {
         try {
             const buffer = Buffer.from(encrypted, 'base64');
-
-            const salt = buffer.slice(0, CRYPTO_CONFIG.SALT_LENGTH);
-            const iv = buffer.slice(
-                CRYPTO_CONFIG.SALT_LENGTH,
-                CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH
-            );
-            const authTag = buffer.slice(
-                CRYPTO_CONFIG.SALT_LENGTH + CRYPTO_CONFIG.IV_LENGTH,
-                CRYPTO_CONFIG.SALT_LENGTH +
-                    CRYPTO_CONFIG.IV_LENGTH +
-                    CRYPTO_CONFIG.AUTH_TAG_LENGTH
-            );
-            const ciphertext = buffer.slice(
-                CRYPTO_CONFIG.SALT_LENGTH +
-                    CRYPTO_CONFIG.IV_LENGTH +
-                    CRYPTO_CONFIG.AUTH_TAG_LENGTH
-            );
-
-            const key = this.deriveKey(purpose, salt);
-
+            const iv = buffer.subarray(0, 12);
+            const authTag = buffer.subarray(12, 28);
+            const ciphertext = buffer.subarray(28);
+            const key = this.deriveKey(purpose);
             const decipher = crypto.createDecipheriv(
                 CRYPTO_CONFIG.ALGORITHM,
                 key,
                 iv
             );
             decipher.setAuthTag(authTag);
-
-            let plaintext = decipher.update(ciphertext, null, 'utf8');
-            plaintext += decipher.final('utf8');
-
-            return plaintext;
+            return Buffer.concat([
+                decipher.update(ciphertext),
+                decipher.final(),
+            ]).toString('utf8');
         } catch (e) {
             return null;
         }
@@ -308,10 +299,11 @@ app.use((req, res, next) => {
     next();
 });
 
-// Request ID
+// Request ID + no-store (don't let proxies/browsers cache API responses)
 app.use((req, res, next) => {
     req.id = crypto.randomBytes(8).toString('hex');
     res.setHeader('X-Request-ID', req.id);
+    res.setHeader('Cache-Control', 'no-store');
     next();
 });
 
@@ -340,6 +332,7 @@ app.use((req, res, next) => {
 // In-memory cache of banned IP hashes (loaded from DB at startup). Checked
 // synchronously on every request so banned IPs are blocked everywhere.
 const bannedIpCache = new Set();
+const bannedUserCache = new Set(); // lowercased banned usernames (loaded at startup)
 const lastSeenIp = new Map(); // username(lower) -> ip hash (best-effort, in-memory)
 
 app.use((req, res, next) => {
@@ -552,17 +545,14 @@ const requireAdmin = (req, res, next) => {
     next();
 };
 
-// Enforce bans on every write — works even with an otherwise-valid token,
-// because the ban list lives in the database (survives restarts).
-const requireNotBanned = async (req, res, next) => {
-    try {
-        if (await db.isBanned(req.user.username)) {
-            return res.status(403).json({ error: 'Banned' });
-        }
-        next();
-    } catch (e) {
-        res.status(500).json({ error: 'Server error' });
+// Enforce bans on every request — works even with an otherwise-valid token.
+// Uses the in-memory ban cache (synced with the DB), so it's a synchronous
+// O(1) check with no per-request database query.
+const requireNotBanned = (req, res, next) => {
+    if (req.user && bannedUserCache.has(req.user.username.toLowerCase())) {
+        return res.status(403).json({ error: 'Banned' });
     }
+    next();
 };
 
 // ============ ENDPOINTS ============
@@ -583,7 +573,7 @@ app.post('/auth/login', createLimiter(60000, 5), async (req, res) => {
         }
         const username = validation.username;
 
-        if (await db.isBanned(username)) {
+        if (bannedUserCache.has(username.toLowerCase())) {
             return res.status(403).json({ error: 'Banned' });
         }
 
@@ -617,7 +607,7 @@ app.post('/auth/login', createLimiter(60000, 5), async (req, res) => {
 });
 
 // Get public chat messages
-app.get('/chat', requireAuth, async (req, res) => {
+app.get('/chat', requireAuth, requireNotBanned, async (req, res) => {
     try {
         const stored = await db.getRecentMessages(MAX_SERVED_MESSAGES);
         const publicMessages = stored.map((m) => ({
@@ -747,7 +737,7 @@ app.post('/whisper', requireAuth, requireNotBanned, chatFloodLimiter, messageLim
 });
 
 // Get whispers for the authenticated user
-app.get('/whispers', requireAuth, async (req, res) => {
+app.get('/whispers', requireAuth, requireNotBanned, async (req, res) => {
     try {
         const username = req.user.username;
         const stored = await db.getWhispersFor(username);
@@ -806,6 +796,7 @@ app.post('/admin/ban', requireAuth, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'Cannot ban admin' });
         }
         await db.addBan(validation.username, reason, req.user.username);
+        bannedUserCache.add(validation.username.toLowerCase());
         sessions.delete(validation.username);
 
         // Also ban the IP we last saw this user on, so they can't dodge the
@@ -833,6 +824,7 @@ app.post('/admin/unban', requireAuth, requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'Invalid target' });
         }
         await db.removeBan(validation.username);
+        bannedUserCache.delete(validation.username.toLowerCase());
         // Lift any IP bans tied to this user.
         const freed = await db.removeIpBansForUser(validation.username);
         for (const h of freed) bannedIpCache.delete(h);
@@ -945,18 +937,25 @@ async function start() {
     try {
         await db.init();
         console.log(`💾 Storage backend: ${db.kind}`);
-        // Warm the IP-ban cache from the database.
+        // Warm the ban caches from the database (sync, O(1) checks afterwards).
         try {
             for (const h of await db.listIpBans()) bannedIpCache.add(h);
+            for (const b of await db.listBans()) bannedUserCache.add(b.username);
         } catch (_) {}
     } catch (e) {
         console.error('❌ Failed to initialize database:', e.message);
         process.exit(1);
     }
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
         console.log(`🔐 Secure Chat Server v4.0 running on port ${PORT}`);
     });
+
+    // Anti-slowloris / slow-DoS: cap how long a request may take to arrive.
+    server.requestTimeout = 20000; // whole request must arrive within 20s
+    server.headersTimeout = 15000; // headers within 15s
+    server.keepAliveTimeout = 30000;
+    server.maxHeadersCount = 50;
 
     // Periodic cleanup of expired rows.
     setInterval(() => {
