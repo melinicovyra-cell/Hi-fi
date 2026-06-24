@@ -342,6 +342,7 @@ const createLimiter = (windowMs, max) =>
 app.use(createLimiter(60000, 100));
 
 // Per-user message limiter (keyed by IP + authenticated username)
+// Owner/admins (privileged) bypass the per-message cooldown entirely.
 const messageLimiter = rateLimit({
     windowMs: 3000,
     max: 1,
@@ -350,6 +351,7 @@ const messageLimiter = rateLimit({
         const username = req.user?.username || '';
         return CryptoUtils.hash(ip + username);
     },
+    skip: (req) => !!(req.user && isAdmin(req.user.username)),
     handler: (req, res) => {
         res.status(429).json({ error: 'Rate limit exceeded', retryAfter: 3 });
     },
@@ -593,15 +595,34 @@ app.post('/chat', requireAuth, requireNotBanned, messageLimiter, async (req, res
         const { message } = req.body;
         const username = req.user.username;
 
-        const muteUntil = await db.getMuteUntil(username);
-        if (muteUntil) {
-            const remaining = Math.ceil((muteUntil - Date.now()) / 1000);
-            return res.status(403).json({ error: `Muted: ${remaining}s` });
+        // Owner/admin bypass: privileged accounts skip the mute and the content
+        // filter (rate limit is already skipped in messageLimiter). Privilege is
+        // proven by ADMIN_SECRET at login, so it can't be impersonated.
+        const privileged = isAdmin(username);
+
+        if (!privileged) {
+            const muteUntil = await db.getMuteUntil(username);
+            if (muteUntil) {
+                const remaining = Math.ceil((muteUntil - Date.now()) / 1000);
+                return res.status(403).json({ error: `Muted: ${remaining}s` });
+            }
         }
 
-        const validation = validateText(message);
-        if (!validation.valid) {
-            return res.status(400).json({ error: validation.reason });
+        let text;
+        if (privileged) {
+            if (!message || typeof message !== 'string') {
+                return res.status(400).json({ error: 'Invalid input' });
+            }
+            text = message.trim().slice(0, 500);
+            if (text.length === 0) {
+                return res.status(400).json({ error: 'Empty message' });
+            }
+        } else {
+            const validation = validateText(message);
+            if (!validation.valid) {
+                return res.status(400).json({ error: validation.reason });
+            }
+            text = validation.text;
         }
 
         const role = getUserRole(username);
@@ -609,7 +630,7 @@ app.post('/chat', requireAuth, requireNotBanned, messageLimiter, async (req, res
             id: generateID(),
             player: username,
             // Encrypted at rest — a leaked DB does not expose chat content.
-            msg: CryptoUtils.encrypt(validation.text, 'message'),
+            msg: CryptoUtils.encrypt(text, 'message'),
             timestamp: Date.now(),
             role,
             type: 'message',
@@ -637,22 +658,36 @@ app.post('/whisper', requireAuth, requireNotBanned, messageLimiter, async (req, 
             return res.status(400).json({ error: 'Cannot message yourself' });
         }
 
-        const validation = validateText(message);
-        if (!validation.valid) {
-            return res.status(400).json({ error: validation.reason });
-        }
+        const privileged = isAdmin(sender);
 
-        const muteUntil = await db.getMuteUntil(sender);
-        if (muteUntil) {
-            const remaining = Math.ceil((muteUntil - Date.now()) / 1000);
-            return res.status(403).json({ error: `Muted: ${remaining}s` });
+        let text;
+        if (privileged) {
+            if (!message || typeof message !== 'string') {
+                return res.status(400).json({ error: 'Invalid input' });
+            }
+            text = message.trim().slice(0, 500);
+            if (text.length === 0) {
+                return res.status(400).json({ error: 'Empty message' });
+            }
+        } else {
+            const validation = validateText(message);
+            if (!validation.valid) {
+                return res.status(400).json({ error: validation.reason });
+            }
+            text = validation.text;
+
+            const muteUntil = await db.getMuteUntil(sender);
+            if (muteUntil) {
+                const remaining = Math.ceil((muteUntil - Date.now()) / 1000);
+                return res.status(403).json({ error: `Muted: ${remaining}s` });
+            }
         }
 
         const whisper = {
             id: generateID(),
             sender,
             target: targetValidation.username,
-            msg: CryptoUtils.encrypt(validation.text, 'whisper'),
+            msg: CryptoUtils.encrypt(text, 'whisper'),
             timestamp: Date.now(),
             encrypted: true,
         };
