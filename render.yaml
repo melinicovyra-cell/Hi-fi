@@ -9,8 +9,10 @@ databases:
     user: chatuser
 
 services:
+  # Service name = subdomain. Deployed URL: https://my-secure-chat.onrender.com
+  # (matches CONFIG.SERVER_URL in client/RussChat.lua).
   - type: web
-    name: secure-chat-server
+    name: my-secure-chat
     runtime: node
     plan: free
     buildCommand: npm install

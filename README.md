@@ -67,7 +67,7 @@ npm start
 - Сам обрабатывает протухший токен (401 → перелогин) и rate-limit (429).
 
 Перед запуском в файле поменяй `CONFIG.SERVER_URL` на адрес своего сервера на Render
-(например `https://secure-chat-server.onrender.com`). Для входа под админом впиши `CONFIG.ADMIN_SECRET`.
+(например `https://my-secure-chat.onrender.com`). Для входа под админом впиши `CONFIG.ADMIN_SECRET`.
 
 ### Bypass-режим владельца
 
