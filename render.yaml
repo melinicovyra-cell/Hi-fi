@@ -1,0 +1,47 @@
+# Render Blueprint — deploys the web service + a PostgreSQL database together.
+# In the Render dashboard: New → Blueprint → connect this repo.
+# Secrets are generated once and persist across deploys.
+
+databases:
+  - name: chat-db
+    plan: free
+    databaseName: chatdb
+    user: chatuser
+
+services:
+  # Service name = subdomain. Deployed URL: https://my-secure-chat.onrender.com
+  # (matches CONFIG.SERVER_URL in client/RussChat.lua).
+  - type: web
+    name: my-secure-chat
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # PostgreSQL connection string, injected from the database above.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: chat-db
+          property: connectionString
+      # Cryptographic secrets — generated once, then kept stable.
+      # MASTER_KEY MUST stay constant or stored encrypted messages become unreadable.
+      - key: MASTER_KEY
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_SECRET
+        generateValue: true
+      - key: HMAC_SECRET
+        generateValue: true
+      # Shared client key — must be the SAME value in client/RussChat.lua
+      # (CONFIG.CLIENT_KEY). Generated here; copy it into the client.
+      - key: CLIENT_KEY
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      # Optional retention tuning.
+      - key: MESSAGE_RETENTION_DAYS
+        value: "30"
+      - key: WHISPER_RETENTION_HOURS
+        value: "24"
