@@ -327,6 +327,64 @@ local ok, buildErr = pcall(function()
         else systemLog("❌ ошибка отправки (" .. tostring(status) .. ")") end
     end
 
+    -- ==== АДМИН-КОМАНДЫ (только в этой версии) ====
+    -- Вводятся в поле чата с "/". Требуют, чтобы ты вошёл как владелец.
+    local function runCommand(input)
+        local args = {}
+        for w in input:gmatch("%S+") do args[#args + 1] = w end
+        local cmd = (args[1] or ""):lower()
+        local SEC = CONFIG.ADMIN_SECRET
+
+        if cmd == "/help" then
+            systemLog("Команды: /ban ник [причина] · /unban ник · /mute ник секунды · /unmute ник · /announce текст · /clear · /bans")
+            return
+        end
+
+        local function adminPost(path, body)
+            body.secret = SEC
+            local data, status = apiRequest("POST", path, body)
+            if status == 401 and login() then
+                body.secret = SEC
+                return apiRequest("POST", path, body)
+            end
+            return data, status
+        end
+        local function ok(d, s, good)
+            if s == 200 then systemLog(good) else systemLog("❌ " .. ((d and d.error) or ("ошибка " .. tostring(s)))) end
+        end
+
+        if cmd == "/ban" then
+            local t = args[2]; if not t then systemLog("⚠️ /ban ник [причина]"); return end
+            local reason = table.concat(args, " ", 3)
+            local d, s = adminPost("/admin/ban", { target = t, reason = reason }); ok(d, s, "🔨 Забанен " .. t)
+        elseif cmd == "/unban" then
+            local t = args[2]; if not t then systemLog("⚠️ /unban ник"); return end
+            local d, s = adminPost("/admin/unban", { target = t }); ok(d, s, "✅ Разбанен " .. t)
+        elseif cmd == "/mute" then
+            local t = args[2]; local dur = tonumber(args[3])
+            if not t or not dur then systemLog("⚠️ /mute ник секунды"); return end
+            local d, s = adminPost("/admin/mute", { target = t, duration = dur }); ok(d, s, "🔇 Мут " .. t .. " на " .. dur .. "с")
+        elseif cmd == "/unmute" then
+            local t = args[2]; if not t then systemLog("⚠️ /unmute ник"); return end
+            local d, s = adminPost("/admin/unmute", { target = t }); ok(d, s, "🔊 Размучен " .. t)
+        elseif cmd == "/announce" then
+            local msg = table.concat(args, " ", 2); if msg == "" then systemLog("⚠️ /announce текст"); return end
+            local d, s = adminPost("/admin/announce", { message = msg }); ok(d, s, "📢 Объявление отправлено")
+        elseif cmd == "/clear" then
+            local d, s = adminPost("/admin/clear", {}); ok(d, s, "🧹 Чат очищен")
+        elseif cmd == "/bans" then
+            local d, s = apiRequest("GET", "/admin/bans?secret=" .. SEC)
+            if s == 200 and type(d) == "table" then
+                if #d == 0 then systemLog("Банов нет") else
+                    local names = {}; for _, b in ipairs(d) do names[#names + 1] = b.username end
+                    systemLog("🔨 Баны (" .. #d .. "): " .. table.concat(names, ", "))
+                end
+            else systemLog("❌ " .. ((d and d.error) or ("ошибка " .. tostring(s)))) end
+        else
+            systemLog("Неизвестная команда. /help — список")
+        end
+    end
+
     -- ==== СВЕРХПЛАВНЫЙ САМОЛЕТИК И ОЧИСТКА ВВОДА ====
     local function sendFlyAnim()
         tween(sendIcon, 0.35, {Position = UDim2.new(1.2, 0, -0.2, 0), ImageTransparency = 1}, Enum.EasingStyle.Quint)
@@ -338,9 +396,10 @@ local ok, buildErr = pcall(function()
     local function doSend()
         local txt = box.Text
         if not txt or txt:gsub("%s", "") == "" then return end
+        box.Text = ""
+        if txt:sub(1, 1) == "/" then task.spawn(runCommand, txt); return end -- админ-команда
         local maxLen = isOwner and 480 or 250                 -- защита: ограничение длины
         if #txt > maxLen then txt = txt:sub(1, maxLen) end
-        box.Text = "" -- Триггерит реактивный мотор, чтобы он плавно отключился обратно в серый цвет
         task.spawn(sendFlyAnim); task.spawn(sendMessage, txt) -- реальная отправка на сервер
     end
     sendBtn.MouseButton1Click:Connect(doSend); box.FocusLost:Connect(function(ent) if ent then doSend() end end)
@@ -372,6 +431,7 @@ local ok, buildErr = pcall(function()
             local okL, err = login()
             if okL then
                 systemLog(isOwner and "👑 Владелец подключён · bypass активен" or "✅ Подключено к серверу")
+                if isOwner then systemLog("Команды админа: введи /help") end
                 while screen.Parent do
                     pcall(fetchMessages)
                     task.wait(math.max(1.2, CONFIG.POLL_INTERVAL))
