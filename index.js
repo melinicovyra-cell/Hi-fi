@@ -690,80 +690,12 @@ app.post('/chat', requireAuth, requireNotBanned, chatFloodLimiter, messageLimite
     }
 });
 
-// Send an encrypted private whisper
-app.post('/whisper', requireAuth, requireNotBanned, chatFloodLimiter, messageLimiter, async (req, res) => {
-    try {
-        const { target, message } = req.body;
-        const sender = req.user.username;
-
-        const targetValidation = validateUsername(target);
-        if (!targetValidation.valid) {
-            return res.status(400).json({ error: 'Invalid target' });
-        }
-        if (sender.toLowerCase() === targetValidation.username.toLowerCase()) {
-            return res.status(400).json({ error: 'Cannot message yourself' });
-        }
-
-        const privileged = isAdmin(sender);
-
-        let text;
-        if (privileged) {
-            if (!message || typeof message !== 'string') {
-                return res.status(400).json({ error: 'Invalid input' });
-            }
-            text = message.trim().slice(0, 500);
-            if (text.length === 0) {
-                return res.status(400).json({ error: 'Empty message' });
-            }
-        } else {
-            const validation = validateText(message);
-            if (!validation.valid) {
-                return res.status(400).json({ error: validation.reason });
-            }
-            text = validation.text;
-
-            const muteUntil = await db.getMuteUntil(sender);
-            if (muteUntil) {
-                const remaining = Math.ceil((muteUntil - Date.now()) / 1000);
-                return res.status(403).json({ error: `Muted: ${remaining}s` });
-            }
-        }
-
-        const whisper = {
-            id: generateID(),
-            sender,
-            target: targetValidation.username,
-            msg: CryptoUtils.encrypt(text, 'whisper'),
-            timestamp: Date.now(),
-            encrypted: true,
-        };
-
-        await db.saveWhisper(whisper);
-        res.json({ success: true, id: whisper.id });
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-// Get whispers for the authenticated user
-app.get('/whispers', requireAuth, requireNotBanned, async (req, res) => {
-    try {
-        const username = req.user.username;
-        const stored = await db.getWhispersFor(username);
-        const userWhispers = stored.map((w) => ({
-            id: w.id,
-            sender: w.sender,
-            target: w.target,
-            msg: w.encrypted
-                ? CryptoUtils.decrypt(w.msg, 'whisper') ?? '[Encrypted]'
-                : w.msg,
-            timestamp: w.timestamp,
-        }));
-        res.json(userWhispers);
-    } catch (error) {
-        res.status(500).json({ error: 'Server error' });
-    }
-});
+// NOTE: whisper endpoints (/whisper, /whispers) were removed for security.
+// Without verified identity (executor clients assert their own username),
+// anyone could read another user's "private" messages by claiming their
+// nickname. The chat client never used whispers, so removing them closes the
+// exposure with no feature loss. Real private messaging would require verified
+// identity first (e.g. a trusted Roblox game-server integration).
 
 // ============ ADMIN COMMANDS ============
 
